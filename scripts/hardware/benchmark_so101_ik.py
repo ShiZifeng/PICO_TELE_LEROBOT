@@ -94,12 +94,12 @@ def benchmark(mode: str, steps: int, warmup: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["pose", "position", "both"], default="both")
+    parser.add_argument("--mode", choices=["pose", "position", "position_wrist", "both"], default="both")
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--warmup", type=int, default=200)
     args = parser.parse_args()
 
-    modes = ["pose", "position"] if args.mode == "both" else [args.mode]
+    modes = ["pose", "position", "position_wrist"] if args.mode == "both" else [args.mode]
     for mode in modes:
         benchmark(mode, args.steps, args.warmup)
 

@@ -145,6 +145,24 @@ python scripts/hardware/debug_xr_axis_mapping.py --controller right
 --ik-control-mode position --debug-xr-delta
 ```
 
+如果 full pose IK 抖动明显，可以增量测试 `position_wrist`：用 4DOF 解 4 个标量约束，追踪 `wrist_link` 的 `xyz`，并用手柄俯仰控制 `gripper_frame_link` 本地 Z 轴相对水平面的仰角；手柄摇杆横向控制最后一个 `wrist_roll` 的旋转速度，且腕旋摇杆不需要按住 grip。
+
+```bash
+--ik-control-mode position_wrist
+```
+
+如果摇杆控制腕旋方向反了，加：
+
+```bash
+--wrist-roll-scale 1.0
+```
+
+如果机械臂伸到最远端仍然抖动，先保留默认 `--max-wrist-reach-m 0.285`；它会限制 `shoulder_link -> wrist_link` 的目标半径，避免 4DOF IK 追不可达目标。若活动范围太小，可以小幅调大，例如：
+
+```bash
+--max-wrist-reach-m 0.300
+```
+
 `simulation` 预设和 MuJoCo/Placo 仿真流程使用完全相同的坐标对齐；`pico` 当前只是 `simulation` 的兼容别名。SO-101 场景中机器人前方是世界 `+X`。
 
 看到 `Dataset created` 和 `MJPEG streaming: http://...` 即启动成功。
