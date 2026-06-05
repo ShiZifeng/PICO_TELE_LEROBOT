@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sL https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz -o /tmp/gh.tar.gz)",
+      "Bash(tar -xzf /tmp/gh.tar.gz -C /tmp)",
+      "Bash(sudo /tmp/gh_2.67.0_linux_amd64/bin/gh auth status)",
+      "Bash(/tmp/gh_2.67.0_linux_amd64/bin/gh auth *)",
+      "Bash(git push *)"
+    ]
+  }
+}
