@@ -55,7 +55,7 @@ SO101_GRIPPER_OPEN_RAD = SO101_GRIPPER_CLOSE_RAD + 0.5 * (SO101_GRIPPER_FULL_OPE
 
 JOINT_LIMITS_RAD = {
     "shoulder_pan": (-1.91986, 1.91986), "shoulder_lift": (-1.74533, 1.74533),
-    "elbow_flex": (-1.50, 1.50), "wrist_flex": (-1.65806, 1.65806),
+    "elbow_flex": (-1.50, 1.50), "wrist_flex": (-2.26893, 2.26893),
     "wrist_roll": (-2.74385, 2.84121), "gripper": (-0.174533, 1.74533),
 }
 
@@ -164,7 +164,7 @@ class XRIKController:
         self,
         mode: str = "single",
         scale_factor: float = 1.0,
-        control_rate_hz: int = 50,
+        control_rate_hz: int = 60,
         max_action_delta_deg: float = 30.0,
         max_target_step_deg: float = 3.0,
         target_filter_alpha: float = 0.35,
@@ -173,6 +173,7 @@ class XRIKController:
         wrist_roll_speed_deg: float = 45.0,
         wrist_roll_stick_axis: str = "x",
         wrist_roll_stick_deadzone: float = 0.08,
+        max_wrist_pitch_deg: float = 130.0,
         max_wrist_reach_m: float = 0.285,
         xr_frame: str = "openxr",
         ik_control_mode: str = "pose",
@@ -194,6 +195,7 @@ class XRIKController:
         self.wrist_roll_speed_rad = np.radians(wrist_roll_speed_deg)
         self.wrist_roll_stick_axis = wrist_roll_stick_axis
         self.wrist_roll_stick_deadzone = wrist_roll_stick_deadzone
+        self.max_wrist_pitch_rad = np.radians(max_wrist_pitch_deg)
         self.max_wrist_reach_m = max_wrist_reach_m
         self.require_xr_confirm = require_xr_confirm
         self.xr_confirm_button = xr_confirm_button
@@ -225,7 +227,9 @@ class XRIKController:
         self.ref_controller_xyz = {}
         self.ref_controller_quat = {}
         self.ref_wrist_pitch_elevation_rad = {}
+        self.ref_wrist_pitch_horizontal_world = {}
         self.desired_wrist_pitch_elevation_rad = {}
+        self.last_wrist_pitch_elevation_rad = {}
         self.direct_wrist_roll_target_rad = {}
         self.wrist_xyz_target_world = {}
         self.gripper_pos_target = {}
@@ -397,7 +401,9 @@ class XRIKController:
                     self.ref_controller_xyz[name] = None
                     self.ref_controller_quat[name] = None
                     self.ref_wrist_pitch_elevation_rad.pop(name, None)
+                    self.ref_wrist_pitch_horizontal_world.pop(name, None)
                     self.desired_wrist_pitch_elevation_rad.pop(name, None)
+                    self.last_wrist_pitch_elevation_rad.pop(name, None)
                     self.direct_wrist_roll_target_rad.pop(name, None)
                     self.wrist_xyz_target_world.pop(name, None)
                 self._hold_effector_at_current_pose(name)
@@ -630,7 +636,9 @@ class XRIKController:
             self.ref_controller_quat[name] = None
             self.active[name] = False
         self.ref_wrist_pitch_elevation_rad = {}
+        self.ref_wrist_pitch_horizontal_world = {}
         self.desired_wrist_pitch_elevation_rad = {}
+        self.last_wrist_pitch_elevation_rad = {}
         self.direct_wrist_roll_target_rad = {}
         self.wrist_xyz_target_world = {}
         self._last_published_target_deg = {}
@@ -691,17 +699,63 @@ class XRIKController:
         prefix = f"{side}_" if self.mode == "dual" else ""
         return f"{prefix}wrist_roll"
 
-    def _tool_pitch_elevation(self, name: str) -> Optional[float]:
+    def _wrist_flex_joint_name(self, name: str) -> str:
+        side = name.removesuffix("_hand")
+        prefix = f"{side}_" if self.mode == "dual" else ""
+        return f"{prefix}wrist_flex"
+
+    def _wrist_pitch_reference_horizontal(self, name: str) -> Optional[np.ndarray]:
+        q_idx = self._q_index(self._wrist_flex_joint_name(name))
+        if q_idx is None:
+            return None
+
+        q_saved = float(self.placo_robot.state.q[q_idx])
+        self.placo_robot.state.q[q_idx] = 0.0
+        self.placo_robot.update_kinematics()
+        T = self.placo_robot.get_T_world_frame(self._pitch_task_link_name(name))
+        axis_world = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        self.placo_robot.state.q[q_idx] = q_saved
+        self.placo_robot.update_kinematics()
+
+        norm = np.linalg.norm(axis_world)
+        if not np.isfinite(norm) or norm < 1e-6:
+            return None
+        horizontal = axis_world / norm
+        horizontal[2] = 0.0
+        horizontal_norm = np.linalg.norm(horizontal)
+        if not np.isfinite(horizontal_norm) or horizontal_norm < 1e-6:
+            return None
+        return horizontal / horizontal_norm
+
+    def _tool_pitch_elevation(self, name: str, hint: Optional[float] = None) -> Optional[float]:
         T = self.placo_robot.get_T_world_frame(self._pitch_task_link_name(name))
         axis_world = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
         norm = np.linalg.norm(axis_world)
         if not np.isfinite(norm) or norm < 1e-6:
             return None
         axis_world = axis_world / norm
-        return float(np.arcsin(np.clip(axis_world[2], -1.0, 1.0)))
+        ref_horizontal = self.ref_wrist_pitch_horizontal_world.get(name)
+        if ref_horizontal is None:
+            ref_horizontal = axis_world.copy()
+            ref_horizontal[2] = 0.0
+            ref_norm = np.linalg.norm(ref_horizontal)
+            if not np.isfinite(ref_norm) or ref_norm < 1e-6:
+                return float(np.arcsin(np.clip(axis_world[2], -1.0, 1.0)))
+            ref_horizontal = ref_horizontal / ref_norm
+        return float(np.arctan2(axis_world[2], float(np.dot(axis_world, ref_horizontal))))
+
+    def _current_tool_pitch_elevation(self, name: str) -> Optional[float]:
+        elevation = self._tool_pitch_elevation(name)
+        if elevation is not None:
+            self.last_wrist_pitch_elevation_rad[name] = elevation
+        return elevation
 
     def _capture_wrist_pitch_reference(self, name: str):
-        elevation = self._tool_pitch_elevation(name)
+        ref_horizontal = self._wrist_pitch_reference_horizontal(name)
+        if ref_horizontal is None:
+            return
+        self.ref_wrist_pitch_horizontal_world[name] = ref_horizontal
+        elevation = self._current_tool_pitch_elevation(name)
         if elevation is None:
             return
         self.ref_wrist_pitch_elevation_rad[name] = elevation
@@ -715,7 +769,7 @@ class XRIKController:
 
         _roll, pitch = self._controller_delta_roll_pitch(ref_quat, ctrl_quat)
         target = ref_elevation - pitch * self.wrist_pitch_scale
-        self.desired_wrist_pitch_elevation_rad[name] = float(np.clip(target, np.radians(-89.0), np.radians(89.0)))
+        self.desired_wrist_pitch_elevation_rad[name] = float(np.clip(target, -self.max_wrist_pitch_rad, self.max_wrist_pitch_rad))
 
     def _capture_wrist_roll_reference(self, name: str):
         q_idx = self._q_index(self._wrist_roll_joint_name(name))
@@ -793,8 +847,8 @@ class XRIKController:
             f"{prefix}wrist_flex",
         ]
 
-    def _position_wrist_task_vector(self, name: str) -> Optional[np.ndarray]:
-        elevation = self._tool_pitch_elevation(name)
+    def _position_wrist_task_vector(self, name: str, elevation_hint: Optional[float] = None) -> Optional[np.ndarray]:
+        elevation = self._tool_pitch_elevation(name, hint=elevation_hint)
         if elevation is None:
             return None
         T = self.placo_robot.get_T_world_frame(self.task_link_name[name])
@@ -831,7 +885,7 @@ class XRIKController:
 
             for _ in range(24):
                 self.placo_robot.update_kinematics()
-                current = self._position_wrist_task_vector(name)
+                current = self._position_wrist_task_vector(name, elevation_hint=target_elevation)
                 if current is None or not np.all(np.isfinite(current)):
                     raise RuntimeError(f"Invalid 4DOF wrist IK state for {name}")
                 error = target - current
@@ -844,7 +898,7 @@ class XRIKController:
                 for col, q_idx in enumerate(q_indices):
                     self.placo_robot.state.q[q_idx] = q0[q_idx] + eps
                     self.placo_robot.update_kinematics()
-                    plus = self._position_wrist_task_vector(name)
+                    plus = self._position_wrist_task_vector(name, elevation_hint=target_elevation)
                     if plus is None or not np.all(np.isfinite(plus)):
                         raise RuntimeError(f"Invalid 4DOF wrist IK Jacobian for {name}")
                     jacobian[:, col] = (plus - current) / eps
@@ -866,6 +920,9 @@ class XRIKController:
                     self.placo_robot.state.q[q_idx] = q_next
 
         self.placo_robot.update_kinematics()
+        for name in self.manipulator_config:
+            if self.effector_control_mode.get(name) == "position_wrist" and self.active.get(name, False):
+                self._current_tool_pitch_elevation(name)
 
     @staticmethod
     def _clip_joint_rad(joint_suffix: str, value: float) -> float:
@@ -882,7 +939,8 @@ class XRIKController:
         delta_T = np.eye(4)
         delta_T[:3, :3] = delta_R
         roll, pitch, _yaw = tf.euler_from_matrix(delta_T, axes="sxyz")
-        return float(roll), float(pitch)
+        continuous_pitch = np.arctan2(delta_R[0, 2], delta_R[0, 0])
+        return float(roll), float(continuous_pitch)
 
     def _restore_inactive_arm_joints(self, q_reference: np.ndarray):
         restored = False
@@ -1115,7 +1173,7 @@ def main():
     parser.add_argument("--command-port", type=int, default=5571, help="Port sending commands to Jetson")
     parser.add_argument("--mode", default="single", choices=["single", "dual"])
     parser.add_argument("--scale-factor", type=float, default=1.0, help="XR motion scaling")
-    parser.add_argument("--control-rate-hz", type=int, default=50, help="IK solver frequency")
+    parser.add_argument("--control-rate-hz", type=int, default=60, help="IK solver frequency")
     parser.add_argument(
         "--xr-frame",
         default="openxr",
@@ -1133,6 +1191,7 @@ def main():
     parser.add_argument("--wrist-roll-speed-deg", type=float, default=45.0, help="Max wrist_roll joystick velocity in deg/s")
     parser.add_argument("--wrist-roll-stick-axis", default="x", choices=["x", "y"], help="Joystick axis used for wrist_roll velocity")
     parser.add_argument("--wrist-roll-stick-deadzone", type=float, default=0.08, help="Joystick deadzone for wrist_roll velocity")
+    parser.add_argument("--max-wrist-pitch-deg", type=float, default=130.0, help="Max absolute wrist/tool pitch target in position_wrist mode")
     parser.add_argument("--max-wrist-reach-m", type=float, default=0.285, help="Position-wrist max shoulder_link->wrist_link reach in meters (0=disable)")
     parser.add_argument("--require-xr-confirm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--xr-confirm-button", default="A", help="XR controller button used to confirm headset-yaw alignment")
@@ -1231,6 +1290,7 @@ def main():
         wrist_roll_speed_deg=args.wrist_roll_speed_deg,
         wrist_roll_stick_axis=args.wrist_roll_stick_axis,
         wrist_roll_stick_deadzone=args.wrist_roll_stick_deadzone,
+        max_wrist_pitch_deg=args.max_wrist_pitch_deg,
         max_wrist_reach_m=args.max_wrist_reach_m,
         xr_frame=args.xr_frame,
         ik_control_mode=args.ik_control_mode,
@@ -1239,10 +1299,11 @@ def main():
         debug_xr_delta=args.debug_xr_delta,
     ))
     logger.info(
-        "IK target smoothing: alpha=%.2f, max_step=%.2f deg/tick, wrist_pitch_scale=%.2f, wrist_roll_scale=%.2f, wrist_roll_speed=%.1f deg/s, max_wrist_reach=%.3f m",
+        "IK target smoothing: alpha=%.2f, max_step=%.2f deg/tick, wrist_pitch_scale=%.2f, max_wrist_pitch=%.1f deg, wrist_roll_scale=%.2f, wrist_roll_speed=%.1f deg/s, max_wrist_reach=%.3f m",
         args.target_filter_alpha,
         args.max_target_step_deg,
         args.wrist_pitch_scale,
+        args.max_wrist_pitch_deg,
         args.wrist_roll_scale,
         args.wrist_roll_speed_deg,
         args.max_wrist_reach_m,

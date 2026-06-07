@@ -12,7 +12,7 @@ Usage (on Jetson):
     --robot-id mobile_follower_arm_dual \
     --ports '{"left": "/dev/left_follower_mobile", "right": "/dev/right_follower_mobile"}' \
     --cameras '{"left_arm": {"type": "opencv", "index": 10, ...}}' \
-    --fps 30 --control-fps 60
+    --fps 60 --control-fps 60
 """
 
 import json
@@ -129,8 +129,9 @@ def main():
     parser.add_argument("--target-port", type=int, default=5580, help="Port to receive joint targets from PC")
     parser.add_argument("--obs-port", type=int, default=5570, help="Port to send observations to PC")
     parser.add_argument("--command-port", type=int, default=5571, help="Port to receive commands from PC")
-    parser.add_argument("--fps", type=int, default=30, help="Sync FPS (observation send rate)")
+    parser.add_argument("--fps", type=int, default=60, help="Sync FPS (observation send rate)")
     parser.add_argument("--control-fps", type=int, default=60, help="Local motor control FPS")
+    parser.add_argument("--interpolate-actions", action="store_true", help="Interpolate received targets locally between observation frames")
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--max-relative-target", type=float, default=None)
     parser.add_argument("--calibrate", action="store_true", help="Run calibration on connect")
@@ -238,25 +239,32 @@ def main():
             except zmq.Again:
                 pass
 
-            # Interpolate and send action to hardware at control_fps
+            # Send action to hardware. Interpolation is optional; PC IK defaults to 60Hz.
             if latest_target is not None:
                 # Convert PC format {left_shoulder_pan: deg} → LeRobot format {left_shoulder_pan.pos: deg}
                 action = {f"{k}.pos": float(v) for k, v in latest_target.items()}
 
-                remaining = max(0, period - (time.perf_counter() - loop_start))
-                num_steps = max(1, int(round(remaining * args.control_fps)))
-                step_s = remaining / num_steps
-
-                for step in range(1, num_steps + 1):
-                    step_start = time.perf_counter()
-                    alpha = step / num_steps
-                    interp = interpolate_action(previous_action, action, alpha)
+                if not args.interpolate_actions or previous_action is None:
                     try:
-                        robot.send_action(interp)
+                        robot.send_action(action)
                     except Exception as e:
                         logger.warning("Motor write error: %s", e)
-                    previous_action = interp
-                    busy_wait(max(0, step_s - (time.perf_counter() - step_start)))
+                    previous_action = action
+                else:
+                    remaining = max(0, period - (time.perf_counter() - loop_start))
+                    num_steps = max(1, int(round(remaining * args.control_fps)))
+                    step_s = remaining / num_steps
+
+                    for step in range(1, num_steps + 1):
+                        step_start = time.perf_counter()
+                        alpha = step / num_steps
+                        interp = interpolate_action(previous_action, action, alpha)
+                        try:
+                            robot.send_action(interp)
+                        except Exception as e:
+                            logger.warning("Motor write error: %s", e)
+                        previous_action = interp
+                        busy_wait(max(0, step_s - (time.perf_counter() - step_start)))
 
             # Build and send observation frame at fps rate
             obs = robot.get_observation()

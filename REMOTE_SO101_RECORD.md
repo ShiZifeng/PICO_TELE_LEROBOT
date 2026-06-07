@@ -72,12 +72,14 @@ python scripts/teleop_so101_remote_jetson.py \
     "right_arm": {"type": "opencv", "index": 8, "width": 640, "height": 480, "fps": 30},
     "head": {"type": "opencv", "index": 0, "width": 640, "height": 480, "fps": 30}
   }' \
-  --fps 30 \
+  --fps 60 \
   --control-fps 60 \
   --jpeg-quality 80
 ```
 
 看到 `Ready. Waiting for joint targets from PC...` 即启动成功。
+
+Jetson 端默认直接发送 PC 端 60Hz IK 目标，不再做本地插值；如需恢复旧插值行为，可额外加 `--interpolate-actions`。
 
 > **安全提示**：第一次建议加 `--max-relative-target 3.0` 限制舵机每步最大移动量。
 
@@ -156,6 +158,8 @@ python scripts/hardware/debug_xr_axis_mapping.py --controller right
 ```bash
 --wrist-roll-scale 1.0
 ```
+
+如果 grip 触发时腕部已经超过 100 度，保持默认 `--max-wrist-pitch-deg 130`，避免目标被夹回 100 度造成俯仰控制反向。需要更保守时可手动调小。
 
 如果机械臂伸到最远端仍然抖动，先保留默认 `--max-wrist-reach-m 0.285`；它会限制 `shoulder_link -> wrist_link` 的目标半径，避免 4DOF IK 追不可达目标。若活动范围太小，可以小幅调大，例如：
 
