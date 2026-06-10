@@ -570,21 +570,7 @@ class XRIKController:
 
         any_wrist_roll_active = self._update_wrist_roll_joystick_controls()
 
-        if not any_active:
-            self._ik_failure_count = 0
-            self._clear_arm_target_cache()
-            targets = self._gripper_to_motor_dict()
-            if any_wrist_roll_active:
-                targets.update(self._wrist_roll_to_motor_dict())
-            targets.update(homing_overrides)
-            self._last_raw_target_deg = dict(targets)
-            filtered = self._filter_target(targets)
-            clipped = self._clip_target_step(filtered)
-            clipped = self._clip_motor_joint_limits(clipped)
-            self._last_output_target_deg = dict(clipped)
-            return clipped
-
-        # 4. Solve — pin homed arm joints to homing targets first so IK
+        # 4. Always solve IK. Homing overrides replace homed arm joints at the end. — pin homed arm joints to homing targets first so IK
         #    only moves the non-homed arm.
         q_before_solve = self.placo_robot.state.q.copy()
         if self._homing_sides:
