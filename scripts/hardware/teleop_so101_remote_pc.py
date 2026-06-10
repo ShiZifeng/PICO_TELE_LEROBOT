@@ -371,29 +371,26 @@ class XRIKController:
                             self.placo_robot.state.q[q_idx] = float(np.radians(value))
         self._has_robot_state = True
 
-    def _start_homing(self, sides: set):
-        """Begin smooth homing from current observed positions to neutral pose."""
-        self._homing_sides = sides
-        self._homing_start_time = time.perf_counter()
-        self._reset_xr_references()
-        self._safety_paused = False
-        self._ik_failure_count = 0
-        # Snapshot current observed joint positions as homing start
-        self._homing_start_positions_deg = dict(self._latest_observed_motor_deg)
-        if sides:
-            sample_side = next(iter(sides))
-            sample_keys = [k for k in self._homing_start_positions_deg if k.startswith(sample_side)]
-            logger.info("Homing start: side=%s, keys=%d, sample=%s",
-                        sample_side, len(sample_keys),
-                        {k: round(self._homing_start_positions_deg.get(k, 0), 1) for k in sample_keys[:3]})
-        # Clear target caches so filter/clip start fresh from current position
-        self._last_published_target_deg = {}
-        self._filtered_target_deg = {}
-        self._last_raw_target_deg = {}
-        self._last_filtered_target_deg = {}
-        self._last_output_target_deg = {}
-        side_str = ",".join(sorted(sides)) if sides else "both"
-        logger.info("Homing started for %s", side_str)
+    def _start_homing(self, side: str):
+        """Begin smooth homing for one arm (idempotent — can add while other arm is homing)."""
+        if side in self._homing_sides:
+            return  # already homing this arm
+        self._homing_sides.add(side)
+        if len(self._homing_sides) == 1:
+            self._homing_start_time = time.perf_counter()
+            self._reset_xr_references()
+            self._safety_paused = False
+            self._ik_failure_count = 0
+            self._last_published_target_deg = {}
+            self._filtered_target_deg = {}
+            self._last_raw_target_deg = {}
+            self._last_filtered_target_deg = {}
+            self._last_output_target_deg = {}
+        # Always snapshot current observed positions (may differ between arms)
+        self._homing_start_positions_deg.update(self._latest_observed_motor_deg)
+        sample_keys = [k for k in self._homing_start_positions_deg if k.startswith(side)]
+        logger.info("Homing started for %s (sample=%s)",
+                    side, {k: round(self._homing_start_positions_deg.get(k, 0), 1) for k in sample_keys[:3]})
 
     def _homing_step(self) -> Dict[str, float]:
         """Produce one tick of homing interpolation for the homed side(s) only.
@@ -456,13 +453,12 @@ class XRIKController:
         self._homing_y_was_down = y_down
         self._homing_b_was_down = b_down
 
-        if not self._homing_sides:
-            if y_edge:
-                logger.info("Homing trigger: Y → left arm")
-                self._start_homing({"left"})
-            if b_edge and not self._homing_sides:
-                logger.info("Homing trigger: B → right arm")
-                self._start_homing({"right"})
+        if y_edge:
+            logger.info("Homing trigger: Y → left arm")
+            self._start_homing("left")
+        if b_edge:
+            logger.info("Homing trigger: B → right arm")
+            self._start_homing("right")
 
         # Compute homing overrides (does NOT return early — IK continues for other arms)
         homing_overrides: Dict[str, float] = {}
@@ -570,20 +566,9 @@ class XRIKController:
 
         any_wrist_roll_active = self._update_wrist_roll_joystick_controls()
 
-        # 4. Always solve IK. Homing overrides replace homed arm joints at the end. — pin homed arm joints to homing targets first so IK
-        #    only moves the non-homed arm.
+        # 4. Always solve IK. Homing is entirely external — solver only sees
+        #    observed positions. Homing overrides replace output at the end.
         q_before_solve = self.placo_robot.state.q.copy()
-        if self._homing_sides:
-            for side in self._homing_sides:
-                prefix = f"{side}_" if self.mode == "dual" else ""
-                for joint in SO101_JOINT_NAMES:
-                    if joint == "gripper":
-                        continue
-                    q_idx = self._q_index(f"{prefix}{joint}")
-                    motor_name = f"{side}_{joint}"
-                    if q_idx is not None and motor_name in homing_overrides:
-                        self.placo_robot.state.q[q_idx] = float(np.radians(homing_overrides[motor_name]))
-            self.placo_robot.update_kinematics()
 
         try:
             if self._uses_position_wrist_4dof_solver():
@@ -605,17 +590,6 @@ class XRIKController:
             return homing_overrides
 
         self._restore_inactive_arm_joints(q_before_solve)
-        # Re-pin homed arm joints after solve (solver may have nudged them)
-        if self._homing_sides:
-            for side in self._homing_sides:
-                prefix = f"{side}_" if self.mode == "dual" else ""
-                for joint in SO101_JOINT_NAMES:
-                    if joint == "gripper":
-                        continue
-                    q_idx = self._q_index(f"{prefix}{joint}")
-                    motor_name = f"{side}_{joint}"
-                    if q_idx is not None and motor_name in homing_overrides:
-                        self.placo_robot.state.q[q_idx] = float(np.radians(homing_overrides[motor_name]))
         self._ik_failure_count = 0
         targets = self._ik_to_motor_dict()
         targets.update(homing_overrides)
