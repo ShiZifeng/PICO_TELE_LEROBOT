@@ -277,6 +277,9 @@ def main():
                     if seq % _ticks_per_record == 0:
                         _record_ready = True
                         _record_condition.notify()
+                        if seq <= 8:  # log first two notify events
+                            logger.info("Notified record loop (seq=%d, obs=%s, action=%s)",
+                                        seq, bool(obs), bool(action))
                 if state_socket is not None:
                     sf = {f"observation.{n}": v for n, v in obs.items()}
                     if action is not None:
@@ -349,6 +352,10 @@ def main():
                     break
                 obs = dict(_control_state["observation"])
                 action = _control_state.get("action")
+                _wake_seq = _control_state["seq"]
+                if _wake_seq <= 12:  # log first few wake-ups
+                    logger.info("Main loop woke at seq=%d, obs=%s, action=%s",
+                                _wake_seq, bool(obs), bool(action))
                 _record_ready = False
                 # If no observation yet, keep waiting
                 if obs is None:
