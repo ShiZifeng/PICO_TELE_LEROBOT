@@ -280,6 +280,25 @@ class XRIKController:
         self._ik_failure_count = 0
         self._last_ik_failure_log_t = 0.0
         self._last_workspace_clip_log_t = 0.0
+
+        # ── Homing state ──
+        # Y or B button triggers smooth homing to a neutral resting pose.
+        self._homing_active = False
+        self._homing_start_time = 0.0
+        self._homing_duration = 2.0  # seconds (smoothstep eased)
+        self._homing_start_positions_deg: Dict[str, float] = {}
+        self._homing_button_was_down = False
+        self._homing_button_name = "Y"  # also checks B as alternative
+        # Neutral home pose (motor degrees). Same for both arms.
+        self._home_pose_deg = {
+            "shoulder_pan": 0.0,
+            "shoulder_lift": -15.0,
+            "elbow_flex": 90.0,
+            "wrist_flex": 45.0,
+            "wrist_roll": 0.0,
+            "gripper": 50.0,
+        }
+
         logger.info(
             "Placo IK ready. XR frame=%s, transform=%s, det=%.1f",
             xr_frame,
@@ -342,6 +361,59 @@ class XRIKController:
                             self.placo_robot.state.q[q_idx] = float(np.radians(value))
         self._has_robot_state = True
 
+    def _start_homing(self):
+        """Begin smooth homing from current observed positions to neutral pose."""
+        self._homing_active = True
+        self._homing_start_time = time.perf_counter()
+        self._reset_xr_references()
+        self._safety_paused = False
+        self._ik_failure_count = 0
+        # Snapshot current observed joint positions as homing start
+        self._homing_start_positions_deg = dict(self._latest_observed_motor_deg)
+        # Clear target caches so filter/clip start fresh from current position
+        self._last_published_target_deg = {}
+        self._filtered_target_deg = {}
+        self._last_raw_target_deg = {}
+        self._last_filtered_target_deg = {}
+        self._last_output_target_deg = {}
+
+    def _homing_step(self) -> Dict[str, float]:
+        """Produce one tick of homing interpolation (smoothstep eased)."""
+        elapsed = time.perf_counter() - self._homing_start_time
+        duration = self._homing_duration
+
+        if elapsed >= duration:
+            # Homing complete — hold at exact home position
+            self._homing_active = False
+            targets = {}
+            for side in self.sides:
+                prefix = f"{side}_" if self.mode == "dual" else ""
+                for joint, home_deg in self._home_pose_deg.items():
+                    targets[f"{side}_{joint}"] = home_deg
+            logger.info("Homing complete (%.1fs). Holding at home pose.", elapsed)
+            self._last_raw_target_deg = dict(targets)
+            self._last_output_target_deg = dict(targets)
+            return targets
+
+        # Smoothstep easing: t^2 * (3 - 2t) → smooth accel/decel
+        t = elapsed / duration
+        t = max(0.0, min(1.0, t))
+        alpha = t * t * (3.0 - 2.0 * t)
+
+        targets = {}
+        for side in self.sides:
+            for joint, home_deg in self._home_pose_deg.items():
+                motor_name = f"{side}_{joint}"
+                start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
+                targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
+
+        self._last_raw_target_deg = dict(targets)
+        filtered = self._filter_target(targets)
+        clipped = self._clip_target_step(filtered)
+        clipped = self._clip_motor_joint_limits(clipped)
+        self._last_output_target_deg = dict(clipped)
+        return clipped
+
     def step(self) -> Dict[str, float]:
         """Run one IK step (matches BaseTeleopController._update_ik)."""
         if not self._has_robot_state:
@@ -357,6 +429,23 @@ class XRIKController:
                 logger.warning("Safety pause cleared. Re-grip to resume teleop.")
             else:
                 return {}
+
+        # ── Homing check (Y or B button edge) ──
+        homing_pressed = False
+        try:
+            homing_pressed = (
+                self.xr_client.get_button_state_by_name(self._homing_button_name)
+                or self.xr_client.get_button_state_by_name("B")
+            )
+        except Exception:
+            pass
+        if homing_pressed and not self._homing_button_was_down and not self._homing_active:
+            self._start_homing()
+            logger.info("Homing started (target: %s)", self._home_pose_deg)
+        self._homing_button_was_down = homing_pressed
+
+        if self._homing_active:
+            return self._homing_step()
 
         # 1. Update kinematics from current robot state (set by update_robot_state)
         self.placo_robot.update_kinematics()
@@ -1089,6 +1178,10 @@ class XRIKController:
             "active": dict(self.active),
             "xr_confirmed": bool(self.xr_confirmed),
             "safety_paused": bool(self._safety_paused),
+            "homing_active": bool(self._homing_active),
+            "homing_progress": float(
+                min(1.0, (time.perf_counter() - self._homing_start_time) / self._homing_duration)
+            ) if self._homing_active else 0.0,
         }
 
     def _process_xr(self, xr_pose, src_name):
@@ -1606,7 +1699,7 @@ def main():
         logger.warning("pynput not available; keyboard control disabled.")
         listener = None
 
-    logger.info("Controls: XR %s or Space=start/stop recording, R=discard, Q/Esc=quit", args.xr_record_button)
+    logger.info("Controls: XR %s/Space=rec, R=discard, Q/Esc=quit, Y/B=home arms", args.xr_record_button)
 
     # ── Main loop: receive observations ──
     try:
