@@ -396,27 +396,22 @@ class XRIKController:
         logger.info("Homing started for %s", side_str)
 
     def _homing_step(self) -> Dict[str, float]:
-        """Produce one tick of homing interpolation (smoothstep eased)."""
+        """Produce one tick of homing interpolation for the homed side(s) only.
+        Returns only the homed arm's targets — non-homed arms continue via IK."""
         elapsed = time.perf_counter() - self._homing_start_time
         duration = self._homing_duration
 
-        # Smoothstep easing: t^2 * (3 - 2t) → smooth accel/decel
         t = elapsed / duration
         t = max(0.0, min(1.0, t))
         alpha = t * t * (3.0 - 2.0 * t)
 
         targets = {}
-        # Fill ALL joints: homed sides interpolate, others hold observed position
-        for side in self.sides:
+        for side in self._homing_sides:
             side_pose = self._home_pose_deg.get(side, {})
-            homing = side in self._homing_sides
             for joint, home_deg in side_pose.items():
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
-                if homing:
-                    targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
-                else:
-                    targets[motor_name] = float(start_deg)  # hold
+                targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
         if alpha < 0.02:
             logger.info("Homing %s: alpha=%.3f, targets=%d keys",
                         sorted(self._homing_sides), alpha, len(targets))
@@ -424,8 +419,6 @@ class XRIKController:
         if elapsed >= duration:
             self._homing_sides.clear()
             logger.info("Homing complete (%.1fs).", elapsed)
-            # Fall through to produce final targets (home position for homed side,
-            # observed hold for other side) then return below.
 
         self._last_raw_target_deg = dict(targets)
         filtered = self._filter_target(targets)
@@ -471,8 +464,11 @@ class XRIKController:
                 logger.info("Homing trigger: B → right arm")
                 self._start_homing({"right"})
 
+        # Compute homing overrides (does NOT return early — IK continues for other arms)
+        homing_overrides: Dict[str, float] = {}
         if self._homing_sides:
-            return self._homing_step()
+            homing_overrides = self._homing_step()
+        _homing_hands = {f"{s}_hand" for s in self._homing_sides}
 
         # 1. Update kinematics from current robot state (set by update_robot_state)
         self.placo_robot.update_kinematics()
@@ -498,6 +494,11 @@ class XRIKController:
         # 2. Process XR input and update frame task targets
         any_active = False
         for name, config in self.manipulator_config.items():
+            if name in _homing_hands:
+                # Homing in progress: hold effector, skip XR update
+                self.active[name] = False
+                self._hold_effector_at_current_pose(name)
+                continue
             xr_grip_val = self.xr_client.get_key_value_by_name(config["control_trigger"])
             self.active[name] = xr_grip_val > 0.9
             any_active = any_active or self.active[name]
@@ -556,8 +557,10 @@ class XRIKController:
                     self.wrist_xyz_target_world.pop(name, None)
                 self._hold_effector_at_current_pose(name)
 
-        # 3. Gripper
+        # 3. Gripper (skip homing arms — homing controls gripper via interpolation)
         for name, config in self.manipulator_config.items():
+            if name in _homing_hands:
+                continue
             if "gripper_config" not in config:
                 continue
             gc = config["gripper_config"]
@@ -573,6 +576,7 @@ class XRIKController:
             targets = self._gripper_to_motor_dict()
             if any_wrist_roll_active:
                 targets.update(self._wrist_roll_to_motor_dict())
+            targets.update(homing_overrides)
             self._last_raw_target_deg = dict(targets)
             filtered = self._filter_target(targets)
             clipped = self._clip_target_step(filtered)
@@ -588,19 +592,23 @@ class XRIKController:
             else:
                 self.solver.solve(True)
         except RuntimeError as e:
-            self._handle_ik_failure(q_before_solve, f"RuntimeError: {e}")
-            return {}
+            if not self._homing_sides:
+                self._handle_ik_failure(q_before_solve, f"RuntimeError: {e}")
+            return homing_overrides
         except Exception as e:
-            self._handle_ik_failure(q_before_solve, f"{type(e).__name__}: {e}")
-            return {}
+            if not self._homing_sides:
+                self._handle_ik_failure(q_before_solve, f"{type(e).__name__}: {e}")
+            return homing_overrides
 
         if not np.all(np.isfinite(self.placo_robot.state.q)):
-            self._handle_ik_failure(q_before_solve, "solver produced non-finite q")
-            return {}
+            if not self._homing_sides:
+                self._handle_ik_failure(q_before_solve, "solver produced non-finite q")
+            return homing_overrides
 
         self._restore_inactive_arm_joints(q_before_solve)
         self._ik_failure_count = 0
         targets = self._ik_to_motor_dict()
+        targets.update(homing_overrides)
         self._last_raw_target_deg = dict(targets)
         filtered = self._filter_target(targets)
         clipped = self._clip_target_step(filtered)
