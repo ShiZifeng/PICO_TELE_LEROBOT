@@ -380,6 +380,12 @@ class XRIKController:
         self._ik_failure_count = 0
         # Snapshot current observed joint positions as homing start
         self._homing_start_positions_deg = dict(self._latest_observed_motor_deg)
+        if sides:
+            sample_side = next(iter(sides))
+            sample_keys = [k for k in self._homing_start_positions_deg if k.startswith(sample_side)]
+            logger.info("Homing start: side=%s, keys=%d, sample=%s",
+                        sample_side, len(sample_keys),
+                        {k: round(self._homing_start_positions_deg.get(k, 0), 1) for k in sample_keys[:3]})
         # Clear target caches so filter/clip start fresh from current position
         self._last_published_target_deg = {}
         self._filtered_target_deg = {}
@@ -402,10 +408,16 @@ class XRIKController:
         targets = {}
         for side in self._homing_sides:
             side_pose = self._home_pose_deg.get(side, {})
+            if not side_pose:
+                logger.warning("Homing: no home pose for side '%s'", side)
+                continue
             for joint, home_deg in side_pose.items():
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
                 targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
+        if alpha < 0.02:
+            logger.info("Homing %s: alpha=%.3f, targets=%d keys",
+                        sorted(self._homing_sides), alpha, len(targets))
 
         if elapsed >= duration:
             self._homing_sides.clear()
@@ -449,9 +461,13 @@ class XRIKController:
 
         if not self._homing_sides:
             if y_edge:
+                logger.info("Homing trigger: Y → left arm")
                 self._start_homing({"left"})
             elif b_edge:
+                logger.info("Homing trigger: B → right arm")
                 self._start_homing({"right"})
+            elif y_down or b_down:
+                logger.info("Homing: Y=%s B=%s (held, waiting release)", y_down, b_down)
 
         if self._homing_sides:
             return self._homing_step()
