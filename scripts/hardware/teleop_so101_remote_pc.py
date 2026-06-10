@@ -27,6 +27,7 @@ Controls:
 import json
 import logging
 import os
+from datetime import datetime
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ import cv2
 import numpy as np
 
 from xrobotoolkit_teleop.common.xr_client import XrClient
+from xrobotoolkit_teleop.hardware.h264_tcp_streamer import H264TCPStreamer
 from xrobotoolkit_teleop.hardware.mjpeg_streamer import MJPEGStreamServer
 from xrobotoolkit_teleop.utils.geometry import (
     R_HEADSET_TO_WORLD,
@@ -165,9 +167,9 @@ class XRIKController:
         mode: str = "single",
         scale_factor: float = 1.0,
         control_rate_hz: int = 60,
-        max_action_delta_deg: float = 30.0,
+        max_action_delta_deg: float = 60.0,
         max_target_step_deg: float = 3.0,
-        target_filter_alpha: float = 0.35,
+        target_filter_alpha: float = 0.05,
         wrist_pitch_scale: float = 1.0,
         wrist_roll_scale: float = -1.0,
         wrist_roll_speed_deg: float = 45.0,
@@ -202,6 +204,7 @@ class XRIKController:
         self.xr_confirmed = not require_xr_confirm
         self._confirm_button_was_down = False
         self._waiting_confirm_logged = False
+        self._last_confirm_debug_t = 0.0
         self.R_xr_confirm = np.eye(3)
         self.debug_xr_delta = debug_xr_delta
         self._last_xr_debug_t = 0.0
@@ -226,6 +229,7 @@ class XRIKController:
         self.ref_ee_quat = {}
         self.ref_controller_xyz = {}
         self.ref_controller_quat = {}
+        self._snapped_robot_q: Optional[np.ndarray] = None  # frozen joint state at grip moment
         self.ref_wrist_pitch_elevation_rad = {}
         self.ref_wrist_pitch_horizontal_world = {}
         self.desired_wrist_pitch_elevation_rad = {}
@@ -297,24 +301,45 @@ class XRIKController:
         return int(joint.idx_q)
 
     def update_robot_state(self, obs_frame: dict):
-        """Update Placo state from real robot observation. Called from main loop."""
-        for side in self.sides:
-            prefix = f"{side}_" if self.mode == "dual" else ""
-            for joint in SO101_JOINT_NAMES:
-                obs_key = f"observation.{side}_{joint}.pos"
-                value = obs_frame.get(obs_key)
-                if value is None:
-                    value = obs_frame.get(f"{side}_{joint}.pos")
-                if value is not None:
-                    value = float(value)
-                    if not np.isfinite(value):
-                        continue
-                    placo_name = f"{prefix}{joint}"
-                    motor_name = f"{side}_{joint}"
-                    self._latest_observed_motor_deg[motor_name] = value
-                    q_idx = self._q_index(placo_name)
-                    if q_idx is not None:
-                        self.placo_robot.state.q[q_idx] = float(np.radians(value))
+        """Update Placo state from real robot observation. Supports both grouped
+        (observation.state array) and per-joint (observation.xxx.pos) formats."""
+        state_arr = obs_frame.get("observation.state")
+        if state_arr is not None:
+            # LeRobot grouped format: observation.state is (12,) array
+            all_joints = []
+            for side in self.sides:
+                for joint in SO101_JOINT_NAMES:
+                    all_joints.append(f"{side}_{joint}")
+            for joint_name, value in zip(all_joints, state_arr):
+                value = float(value)
+                if not np.isfinite(value):
+                    continue
+                side, joint = joint_name.split("_", 1)
+                prefix = f"{side}_"
+                placo_name = f"{prefix}{joint}"
+                self._latest_observed_motor_deg[joint_name] = value
+                q_idx = self._q_index(placo_name)
+                if q_idx is not None:
+                    self.placo_robot.state.q[q_idx] = float(np.radians(value))
+        else:
+            # Legacy per-joint format
+            for side in self.sides:
+                prefix = f"{side}_" if self.mode == "dual" else ""
+                for joint in SO101_JOINT_NAMES:
+                    obs_key = f"observation.{side}_{joint}.pos"
+                    value = obs_frame.get(obs_key)
+                    if value is None:
+                        value = obs_frame.get(f"{side}_{joint}.pos")
+                    if value is not None:
+                        value = float(value)
+                        if not np.isfinite(value):
+                            continue
+                        placo_name = f"{prefix}{joint}"
+                        motor_name = f"{side}_{joint}"
+                        self._latest_observed_motor_deg[motor_name] = value
+                        q_idx = self._q_index(placo_name)
+                        if q_idx is not None:
+                            self.placo_robot.state.q[q_idx] = float(np.radians(value))
         self._has_robot_state = True
 
     def step(self) -> Dict[str, float]:
@@ -346,6 +371,10 @@ class XRIKController:
             if not self._waiting_confirm_logged:
                 logger.info("XR alignment not confirmed yet. Press controller button '%s' before using grip.", self.xr_confirm_button)
                 self._waiting_confirm_logged = True
+            now = time.perf_counter()
+            if now - self._last_confirm_debug_t > 3.0:
+                self._last_confirm_debug_t = now
+                logger.info("Waiting for %s button (currently pressed: %s)", self.xr_confirm_button, self._confirm_button_was_down)
             self._reset_xr_references()
             self._hold_all_effectors_at_current_pose()
             return self._hold_command()
@@ -359,14 +388,16 @@ class XRIKController:
 
             if self.active[name]:
                 if self.ref_ee_xyz.get(name) is None:
+                    # Snapshot current robot joint state to freeze reference
+                    self._snapped_robot_q = self.placo_robot.state.q.copy()
                     link = self.task_link_name[name]
-                    T = self.placo_robot.get_T_world_frame(link)
+                    T = self._fk_from_snapped(link)
                     self.ref_ee_xyz[name] = T[:3, 3].copy()
                     self.ref_ee_quat[name] = self._mat_to_quat(T)
                     if self.effector_control_mode[name] == "position_wrist":
                         self._capture_wrist_pitch_reference(name)
                         self._capture_wrist_roll_reference(name)
-                    logger.info("[%s] Activated.", name)
+                    logger.debug("[%s] Activated.", name)
 
                 xr_pose = self.xr_client.get_pose_by_name(config["pose_source"])
                 if not self._is_valid_xr_pose(xr_pose):
@@ -395,11 +426,12 @@ class XRIKController:
                     self.effector_task[name].T_world_frame = target_pose
             else:
                 if self.ref_ee_xyz.get(name) is not None:
-                    logger.info("[%s] Deactivated.", name)
+                    logger.debug("[%s] Deactivated.", name)
                     self.ref_ee_xyz[name] = None
                     self.ref_ee_quat[name] = None
                     self.ref_controller_xyz[name] = None
                     self.ref_controller_quat[name] = None
+                    self._snapped_robot_q = None
                     self.ref_wrist_pitch_elevation_rad.pop(name, None)
                     self.ref_wrist_pitch_horizontal_world.pop(name, None)
                     self.desired_wrist_pitch_elevation_rad.pop(name, None)
@@ -635,6 +667,7 @@ class XRIKController:
             self.ref_controller_xyz[name] = None
             self.ref_controller_quat[name] = None
             self.active[name] = False
+        self._snapped_robot_q = None
         self.ref_wrist_pitch_elevation_rad = {}
         self.ref_wrist_pitch_horizontal_world = {}
         self.desired_wrist_pitch_elevation_rad = {}
@@ -648,8 +681,23 @@ class XRIKController:
         for name in self.manipulator_config:
             self._hold_effector_at_current_pose(name)
 
+    def _fk_from_snapped(self, link_name: str):
+        """Compute FK of link from the snapped (frozen) robot state."""
+        import placo
+        saved_q = self.placo_robot.state.q.copy()
+        try:
+            self.placo_robot.state.q[:] = self._snapped_robot_q
+            self.placo_robot.update_kinematics()
+            return self.placo_robot.get_T_world_frame(link_name)
+        finally:
+            self.placo_robot.state.q[:] = saved_q
+            self.placo_robot.update_kinematics()
+
     def _hold_effector_at_current_pose(self, name: str):
-        T = self.placo_robot.get_T_world_frame(self.task_link_name[name])
+        if self._snapped_robot_q is not None:
+            T = self._fk_from_snapped(self.task_link_name[name])
+        else:
+            T = self.placo_robot.get_T_world_frame(self.task_link_name[name])
         if self.effector_control_mode.get(name) in ("position", "position_wrist"):
             self.effector_task[name].target_world = T[:3, 3].copy()
         else:
@@ -1122,6 +1170,37 @@ class XRIKController:
         return tf.quaternion_matrix(q)
 
 
+def _save_episode_quiet(dataset):
+    """Save episode with suppressed video encoder output and progress bar."""
+    import os, sys, threading, time as _time
+    done = [False]
+
+    def _spinner():
+        chars = "|/-\\"
+        i = 0
+        while not done[0]:
+            sys.stderr.write(f"\r  Encoding videos... {chars[i % len(chars)]}")
+            sys.stderr.flush()
+            i += 1
+            _time.sleep(0.15)
+        sys.stderr.write("\r  Encoding videos... done     \n")
+        sys.stderr.flush()
+
+    t = threading.Thread(target=_spinner, daemon=True)
+    old_env = os.environ.get("SVT_LOG")
+    os.environ["SVT_LOG"] = "0"
+    try:
+        t.start()
+        dataset.save_episode()
+    finally:
+        done[0] = True
+        t.join(timeout=1)
+        if old_env is not None:
+            os.environ["SVT_LOG"] = old_env
+        else:
+            os.environ.pop("SVT_LOG", None)
+
+
 def decode_frame(frame: dict) -> dict:
     """Decode JPEG-encoded images in a LeRobot frame dict."""
     out = {}
@@ -1130,6 +1209,8 @@ def decode_frame(frame: dict) -> dict:
             img = cv2.imdecode(np.frombuffer(v["data"], dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 out[k] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        elif isinstance(v, (float, int)):
+            out[k] = np.array([v], dtype=np.float32)
         else:
             out[k] = v
     return out
@@ -1169,11 +1250,13 @@ def main():
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--listen-ip", default="0.0.0.0")
     parser.add_argument("--obs-port", type=int, default=5570, help="Port receiving observations from Jetson")
+    parser.add_argument("--state-port", type=int, default=5572, help="Port receiving lightweight 60Hz joint state from Jetson (0=disable)")
     parser.add_argument("--target-port", type=int, default=5580, help="Port sending joint targets to Jetson")
     parser.add_argument("--command-port", type=int, default=5571, help="Port sending commands to Jetson")
     parser.add_argument("--mode", default="single", choices=["single", "dual"])
     parser.add_argument("--scale-factor", type=float, default=1.0, help="XR motion scaling")
-    parser.add_argument("--control-rate-hz", type=int, default=60, help="IK solver frequency")
+    parser.add_argument("--control-rate-hz", type=int, default=60, help="IK solver frequency (aligned with Jetson control_fps)")
+    parser.add_argument("--debug-vis", action="store_true", help="Show real-time joint target + safety visualization")
     parser.add_argument(
         "--xr-frame",
         default="openxr",
@@ -1200,7 +1283,7 @@ def main():
     parser.add_argument(
         "--max-action-delta-deg",
         type=float,
-        default=30.0,
+        default=60.0,
         help="Pause publishing if any non-gripper target differs from observation by more than this many degrees (0=disable)",
     )
     parser.add_argument(
@@ -1212,7 +1295,7 @@ def main():
     parser.add_argument(
         "--target-filter-alpha",
         type=float,
-        default=0.35,
+        default=0.05,
         help="Low-pass filter alpha for non-gripper IK targets before clipping (0<alpha<1, smaller=smoother/slower, 1=disable)",
     )
     parser.add_argument(
@@ -1224,8 +1307,16 @@ def main():
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--display", action="store_true", default=False)
     parser.add_argument("--preview-height", type=int, default=240)
-    parser.add_argument("--mjpeg-port", type=int, default=8080, help="MJPEG streaming port for XR (0=disable)")
+    parser.add_argument("--mjpeg-port", type=int, default=0, help="MJPEG streaming port for browser (0=disable)")
     parser.add_argument("--mjpeg-quality", type=int, default=70, help="MJPEG JPEG quality (10-100)")
+    parser.add_argument("--h264-port", type=int, default=12345, help="H.264 TCP video port (0=disable)")
+    parser.add_argument("--h264-control-port", type=int, default=13579, help="H.264 TCP control port")
+    parser.add_argument("--h264-width", type=int, default=1280, help="H.264 output width")
+    parser.add_argument("--h264-height", type=int, default=720, help="H.264 output height")
+    parser.add_argument("--h264-fps", type=int, default=15, help="H.264 output FPS")
+    parser.add_argument("--h264-bitrate", type=int, default=8_000_000, help="H.264 bitrate in bps")
+    parser.add_argument("--record-every-n", type=int, default=1, help="Record every Nth frame (1=all at Jetson fps, typically 15Hz)")
+    parser.add_argument("--record-image-writer-threads", type=int, default=12, help="Async image writer threads")
     args = parser.parse_args()
 
     LeRobotDataset, DEFAULT_FEATURES, build_dataset_frame, hw_to_dataset_features = _ensure_lerobot_deps()
@@ -1238,9 +1329,18 @@ def main():
     obs_socket.setsockopt(zmq.RCVHWM, 1)
     obs_socket.bind(f"tcp://{args.listen_ip}:{args.obs_port}")
 
+    state_socket = None
+    if args.state_port > 0:
+        state_socket = ctx.socket(zmq.PULL)
+        state_socket.setsockopt(zmq.RCVHWM, 1)
+        state_socket.setsockopt(zmq.RCVTIMEO, 1000)
+        state_socket.bind(f"tcp://{args.listen_ip}:{args.state_port}")
+
     # Send joint targets to Jetson (PUB)
     target_socket = ctx.socket(zmq.PUB)
-    target_socket.setsockopt(zmq.SNDHWM, 1)
+    target_socket.setsockopt(zmq.SNDHWM, 500)  # buffer ~2s at 250Hz to avoid drops
+    try: target_socket.setsockopt(50, 1)  # ZMQ_TCP_NODELAY
+    except Exception: pass
     target_socket.bind(f"tcp://{args.listen_ip}:{args.target_port}")
 
     # Send commands to Jetson (PUB)
@@ -1249,6 +1349,8 @@ def main():
     cmd_socket.bind(f"tcp://{args.listen_ip}:{args.command_port}")
 
     logger.info("Listening for observations on tcp://%s:%d", args.listen_ip, args.obs_port)
+    if state_socket is not None:
+        logger.info("Listening for 60Hz joint state on tcp://%s:%d", args.listen_ip, args.state_port)
     logger.info("Publishing joint targets on tcp://%s:%d", args.listen_ip, args.target_port)
 
     ik_target_log_fh = None
@@ -1265,6 +1367,21 @@ def main():
         mjpeg.start()
         logger.info("MJPEG streaming: %s", mjpeg.url)
         logger.info("  PICO browser → %s", mjpeg.url)
+
+    # ── H.264 TCP streamer (for PICO APK Remote Vision) ──
+    h264 = None
+    if args.h264_port > 0:
+        h264 = H264TCPStreamer(
+            control_port=args.h264_control_port,
+            video_port=args.h264_port,
+            width=args.h264_width,
+            height=args.h264_height,
+            fps=args.h264_fps,
+            bitrate=args.h264_bitrate,
+        )
+        h264.start()
+        logger.info("H.264 TCP streaming: %s", h264.url)
+        logger.info("  PICO APK Remote Vision → ZEDMINI → Listen")
 
     # ── XR + IK ──
     # Store controller in a function that re-validates on each access.
@@ -1313,6 +1430,40 @@ def main():
             "Position-wrist mode: IK tracks wrist_link xyz + scalar wrist/tool elevation; joystick controls wrist_roll velocity.",
         )
 
+    ik_controller_lock = threading.RLock()
+    state_stop = threading.Event()
+    state_thread = None
+    if state_socket is not None:
+        def state_loop():
+            state_count = 0
+            last_log_t = time.perf_counter()
+            while not state_stop.is_set():
+                try:
+                    msg = state_socket.recv_pyobj()
+                except zmq.Again:
+                    continue
+                except Exception as e:
+                    if not state_stop.is_set():
+                        logger.warning("State receiver error: %s", e)
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != "state":
+                    continue
+                frame = msg.get("frame", {})
+                try:
+                    with ik_controller_lock:
+                        _ik_ref.get().update_robot_state(frame)
+                    state_count += 1
+                except Exception as e:
+                    logger.warning("update_robot_state from state stream failed: %s", e)
+                now = time.perf_counter()
+                if now - last_log_t >= 5.0:
+                    logger.debug("State stream: %.1f msg/s", state_count / (now - last_log_t))
+                    state_count = 0
+                    last_log_t = now
+
+        state_thread = threading.Thread(target=state_loop, daemon=True, name="state-recv")
+        state_thread.start()
+
     # ── Recording state ──
     dataset = None
     task = None
@@ -1325,6 +1476,24 @@ def main():
     recv_frames = 0
     xr_record_button_was_down = False
     last_xr_record_button_error_t = 0.0
+
+    # ── Debug visualizer ──
+    debug_viz = None
+    if args.debug_vis:
+        import os, sys
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        from debug_ik_visualizer import DebugIKVisualizer
+        viz_joints = []
+        for side in (["left", "right"] if args.mode == "dual" else ["right"]):
+            for j in SO101_JOINT_NAMES:
+                viz_joints.append(f"{side}_{j}")
+        viz_save = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs",
+                               f"ik_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        debug_viz = DebugIKVisualizer(viz_joints, history_s=5.0, update_hz=10, save_path=viz_save)
+        debug_viz.start()
+        logger.info("Debug IK visualizer started (%d joints)", len(viz_joints))
 
     # ── IK thread ──
     latest_target: Dict[str, float] = {}
@@ -1343,8 +1512,9 @@ def main():
         while not ik_stop.is_set():
             t0 = time.perf_counter()
             try:
-                ctrl = ik_ref.get()
-                target = ctrl.step()
+                with ik_controller_lock:
+                    ctrl = ik_ref.get()
+                    target = ctrl.step()
                 latest_target = target if target else {}
                 ik_error_count = 0
             except Exception as e:
@@ -1361,8 +1531,16 @@ def main():
                 try:
                     target_socket.send_pyobj(latest_target, flags=zmq.NOBLOCK)
                     ik_send_count += 1
+                    # Debug visualization (always when enabled)
+                    if debug_viz is not None:
+                        with ik_controller_lock:
+                            snapshot = ctrl.target_debug_snapshot()
+                        debug_viz.update(snapshot)
+                    # IK target JSONL logging (when enabled)
                     if ik_target_log_fh is not None:
-                        snapshot = ctrl.target_debug_snapshot()
+                        if debug_viz is None:
+                            with ik_controller_lock:
+                                snapshot = ctrl.target_debug_snapshot()
                         ik_seq += 1
                         record = {
                             "seq": ik_seq,
@@ -1385,9 +1563,9 @@ def main():
             if elapsed > period:
                 ik_late_count += 1
             now = time.perf_counter()
-            if now - ik_last_stats_t >= 1.0:
+            if now - ik_last_stats_t >= 5.0:
                 dt = now - ik_last_stats_t
-                logger.info(
+                logger.debug(
                     "IK fps: %.1f tick/s, %.1f publish/s, max_step=%.2fms, late=%d",
                     ik_tick_count / dt,
                     ik_send_count / dt,
@@ -1406,6 +1584,7 @@ def main():
 
     # ── Keyboard listener ──
     keyboard_events = {"toggle_recording": False, "discard_episode": False, "stop": False}
+    _saving = False  # guard against double-trigger during video encoding
 
     def on_press(key):
         try:
@@ -1448,6 +1627,10 @@ def main():
             if msg_type == "setup":
                 logger.info("Received setup: fps=%d, robot_type=%s, features=%d",
                             msg.get("fps"), msg.get("robot_type"), len(msg.get("features", {})))
+                # Auto-align H.264 FPS to match Jetson observation rate
+                if h264 is not None and msg.get("fps"):
+                    h264._fps = int(msg["fps"])
+                    logger.info("H.264 FPS aligned to Jetson: %d", h264._fps)
                 task = msg.get("task", "XR teleop")
                 features = msg["features"]
                 features.update(DEFAULT_FEATURES)
@@ -1478,6 +1661,7 @@ def main():
                             dataset.revision = None
                             dataset.tolerance_s = 1e-4
                             dataset.image_writer = None
+                            dataset.start_image_writer(num_threads=args.record_image_writer_threads)
                             dataset.batch_encoding_size = 1
                             dataset.episodes_since_last_encoding = 0
                             dataset.episodes = None
@@ -1497,6 +1681,7 @@ def main():
                                 repo_id=args.repo_id, fps=msg["fps"], root=str(root),
                                 robot_type=msg.get("robot_type", "so101_follower"),
                                 features=features, use_videos=True,
+                                image_writer_threads=args.record_image_writer_threads,
                             )
                             logger.info("Dataset created (after cleanup): %s", dataset.root)
                     else:
@@ -1504,6 +1689,7 @@ def main():
                             repo_id=args.repo_id, fps=msg["fps"], root=str(root),
                             robot_type=msg.get("robot_type", "so101_follower"),
                             features=features, use_videos=True,
+                            image_writer_threads=args.record_image_writer_threads,
                         )
                         logger.info("Dataset created: %s (fps=%d)", dataset.root, msg["fps"])
                 except Exception as e:
@@ -1524,6 +1710,17 @@ def main():
                             short_name = ik.replace("observation.images.", "")
                             mjpeg.update_raw(short_name, img_data["data"])
 
+                # Push BGR frames to H.264 TCP streamer
+                if h264 is not None and image_keys:
+                    raw_frame = msg["frame"]
+                    for ik in image_keys:
+                        img_data = raw_frame.get(ik)
+                        if isinstance(img_data, dict) and img_data.get("__remote_image_encoding__") == "jpg":
+                            bgr = cv2.imdecode(np.frombuffer(img_data["data"], dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                short_name = ik.replace("observation.images.", "")
+                                h264.update(short_name, bgr)
+
                 frame = decode_frame(msg["frame"])
                 recv_frames += 1
 
@@ -1539,11 +1736,17 @@ def main():
                         last_xr_record_button_error_t = now
                         logger.warning("Failed to read XR record button '%s': %s", args.xr_record_button, e)
 
-                # Feed real robot state to IK controller (matches _update_robot_state)
-                try:
-                    _ik_ref.get().update_robot_state(frame)
-                except Exception:
-                    pass
+                # Feed real robot state to IK only when the dedicated 60Hz state stream is disabled.
+                # With state stream enabled, the 15Hz video/record frame would otherwise overwrite
+                # fresher joint state and make IK debug look stair-stepped again.
+                if state_socket is None:
+                    try:
+                        with ik_controller_lock:
+                            _ik_ref.get().update_robot_state(frame)
+                    except Exception as e:
+                        now = time.perf_counter()
+                        if now - last_fps_t >= 5.0:
+                            logger.warning("update_robot_state failed: %s", e)
                 now = time.perf_counter()
                 if now - last_fps_t >= 1.0:
                     fps_display = recv_frames / (now - last_fps_t)
@@ -1551,7 +1754,10 @@ def main():
                     last_fps_t = now
 
                 if recording:
-                    dataset.add_frame(frame, task=task)
+                    if episode_frame_count % args.record_every_n == 0:
+                        missing = [ik for ik in image_keys if ik not in frame]
+                        if not missing:
+                            dataset.add_frame(frame, task=task)
                     episode_frame_count += 1
 
                 if args.display:
@@ -1573,13 +1779,19 @@ def main():
                         logger.warning("OpenCV GUI not available, disabling display")
                         args.display = False
 
-                if keyboard_events["toggle_recording"]:
+                if keyboard_events["toggle_recording"] and not _saving:
                     keyboard_events["toggle_recording"] = False
                     if recording:
                         if episode_frame_count > 0:
-                            dataset.save_episode()
+                            _saving = True
+                            fps = dataset.fps if dataset else 15
+                            logger.info("Saving episode %d (%d frames, %.1fs) ...",
+                                        dataset.num_episodes, episode_frame_count,
+                                        episode_frame_count / max(fps, 1))
+                            _save_episode_quiet(dataset)
                             saved_episodes += 1
-                            logger.info("Saved episode %d", dataset.num_episodes - 1)
+                            logger.info("Episode %d saved ✓", dataset.num_episodes - 1)
+                            _saving = False
                         recording = False
                         episode_frame_count = 0
                     else:
@@ -1588,29 +1800,34 @@ def main():
                         recording = True
                         logger.info("Started episode %d", dataset.num_episodes)
 
-                if keyboard_events["discard_episode"]:
+                if keyboard_events["discard_episode"] and not _saving:
                     keyboard_events["discard_episode"] = False
                     dataset.clear_episode_buffer()
                     episode_frame_count = 0
                     recording = False
                     logger.info("Discarded current episode.")
-
-                if keyboard_events["stop"]:
                     if recording and episode_frame_count > 0:
-                        dataset.save_episode()
+                        logger.info("Saving final episode %d ...", dataset.num_episodes)
+                        _save_episode_quiet(dataset)
                         saved_episodes += 1
+                        logger.info("Episode %d saved ✓", dataset.num_episodes - 1)
                     cmd_socket.send_string("stop")
                     break
 
             elif msg_type == "done":
                 if recording and episode_frame_count > 0:
-                    dataset.save_episode()
+                    logger.info("Saving final episode %d ...", dataset.num_episodes)
+                    _save_episode_quiet(dataset)
                     saved_episodes += 1
+                    logger.info("Episode %d saved ✓", dataset.num_episodes - 1)
                 break
 
     except KeyboardInterrupt:
         logger.info("Interrupted.")
     finally:
+        state_stop.set()
+        if state_thread is not None and state_thread.is_alive():
+            state_thread.join(timeout=2)
         ik_stop.set()
         if ik_thread.is_alive():
             ik_thread.join(timeout=2)
@@ -1622,11 +1839,17 @@ def main():
             pass
         if mjpeg:
             mjpeg.stop()
+        if h264:
+            h264.stop()
+        if debug_viz:
+            debug_viz.stop()
         if ik_target_log_fh is not None:
             ik_target_log_fh.close()
         cmd_socket.send_string("stop")
         target_socket.close(0)
         obs_socket.close(0)
+        if state_socket is not None:
+            state_socket.close(0)
         cmd_socket.close(0)
         ctx.term()
         logger.info("Shutdown complete. Total saved episodes: %d", saved_episodes)

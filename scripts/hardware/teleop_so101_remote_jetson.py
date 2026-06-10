@@ -8,7 +8,7 @@ sends observations back to PC in LeRobot-compatible format.
 
 Usage (on Jetson):
   python teleop_so101_remote_jetson.py \
-    --pc-ip 192.168.50.101 \
+    --pc-ip 192.168.50.75 \
     --robot-id mobile_follower_arm_dual \
     --ports '{"left": "/dev/left_follower_mobile", "right": "/dev/right_follower_mobile"}' \
     --cameras '{"left_arm": {"type": "opencv", "index": 10, ...}}' \
@@ -62,6 +62,8 @@ def open_cameras(camera_configs: dict) -> dict:
     for name, cfg in camera_configs.items():
         idx = cfg.get("index", 0)
         cap = cv2.VideoCapture(idx)
+        if idx >= 8:  # arm cameras: use MJPEG to avoid USB bandwidth saturation
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.get("width", 640))
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.get("height", 480))
         cap.set(cv2.CAP_PROP_FPS, cfg.get("fps", 30))
@@ -135,6 +137,9 @@ def main():
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--max-relative-target", type=float, default=None)
     parser.add_argument("--calibrate", action="store_true", help="Run calibration on connect")
+    parser.add_argument("--state-port", type=int, default=0, help="Port for high-frequency joint state to PC")
+    parser.add_argument("--control-log", type=Path, default=None, help="JSONL path for control loop logging")
+    parser.add_argument("--control-log-every-n", type=int, default=1, help="Log every Nth control tick")
     args = parser.parse_args()
 
     ports = json.loads(args.ports)
@@ -169,12 +174,39 @@ def main():
     caps = open_cameras(camera_configs) if camera_configs else {}
     image_keys = [f"observation.images.{name}" for name in caps]
 
+    # ── Control log ──
+    control_log = None
+    if args.control_log is not None:
+        import queue, threading as _th
+        class _AsyncJsonlLogger:
+            def __init__(self, path, max_queue=10000):
+                self._q = queue.Queue(maxsize=max_queue); self._stop = _th.Event(); self._drop = 0
+                self._t = _th.Thread(target=self._run, daemon=True)
+            def start(self): self._t.start()
+            def log(self, r):
+                r["wall_time"] = time.time(); r["monotonic_time"] = time.perf_counter()
+                try: self._q.put_nowait(r)
+                except queue.Full: self._drop += 1
+            def stop(self):
+                self._stop.set(); self._t.join(timeout=2)
+                if self._drop: logger.warning("Control log dropped %d", self._drop)
+            def _run(self):
+                with open(args.control_log, "a", buffering=1) as f:
+                    while not self._stop.is_set() or not self._q.empty():
+                        try: f.write(json.dumps(self._q.get(timeout=0.1), ensure_ascii=False, sort_keys=True) + "\n")
+                        except queue.Empty: pass
+        control_log = _AsyncJsonlLogger(args.control_log)
+        control_log.start()
+        logger.info("Control JSONL log: %s", args.control_log)
+
     # ── Setup ZMQ ──
     ctx = zmq.Context()
 
     target_socket = ctx.socket(zmq.SUB)
-    target_socket.setsockopt(zmq.RCVHWM, 1)
+    target_socket.setsockopt(zmq.RCVHWM, 100)
     target_socket.setsockopt(zmq.CONFLATE, 1)
+    try: target_socket.setsockopt(50, 1)  # ZMQ_TCP_NODELAY (pyzmq compat)
+    except Exception: pass
     target_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     target_socket.connect(f"tcp://{args.pc_ip}:{args.target_port}")
 
@@ -182,19 +214,95 @@ def main():
     obs_socket.setsockopt(zmq.SNDHWM, 1)
     obs_socket.connect(f"tcp://{args.pc_ip}:{args.obs_port}")
 
+    state_socket = None
+    if args.state_port > 0:
+        state_socket = ctx.socket(zmq.PUSH)
+        state_socket.setsockopt(zmq.SNDHWM, 1)
+        state_socket.connect(f"tcp://{args.pc_ip}:{args.state_port}")
+
     cmd_socket = ctx.socket(zmq.SUB)
     cmd_socket.setsockopt(zmq.RCVHWM, 1)
     cmd_socket.setsockopt(zmq.CONFLATE, 1)
     cmd_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     cmd_socket.connect(f"tcp://{args.pc_ip}:{args.command_port}")
 
+    # ── Control thread (60Hz): send_action + read obs + state_tx + log ──
+    import threading as _th2
+    _control_state = {"action": None, "observation": None, "obs_t": 0.0, "seq": 0}
+    _control_lock = _th2.Lock()
+    _control_stop = _th2.Event()
+
+    def _control_loop():
+        period = 1.0 / args.control_fps
+        next_tick = time.perf_counter()
+        seq, tx_seq = 0, 0
+        prev_keys = None; tx_updates = 0; tx_msgs = 0
+        last_stats_t = time.perf_counter()
+        while not _control_stop.is_set():
+            t0 = time.perf_counter()
+            # Drain ZMQ targets
+            try:
+                while True:
+                    t = target_socket.recv_pyobj(flags=zmq.NOBLOCK)
+                    if isinstance(t, dict) and not t.get("__hold__"):
+                        action = {f"{k}.pos": float(v) for k, v in t.items()}
+                        with _control_lock: _control_state["action"] = action
+                        cur = tuple(sorted(t.items()))
+                        if cur != prev_keys: tx_updates += 1; prev_keys = cur
+                        tx_msgs += 1; tx_seq += 1
+                        if control_log is not None:
+                            control_log.log({"event":"target_rx","seq":tx_seq,"target_raw":t,"action_target":action,"recv_ms":(time.perf_counter()-t0)*1000})
+                    elif isinstance(t, dict) and t.get("__hold__"):
+                        with _control_lock: _control_state["action"] = None
+                        prev_keys = None; tx_msgs += 1; tx_seq += 1
+            except zmq.Again: pass
+
+            action = None
+            with _control_lock: action = _control_state.get("action")
+            seq += 1
+            try:
+                sm, om = 0.0, 0.0
+                if action is not None:
+                    t0 = time.perf_counter(); robot.send_action(action); sm = (time.perf_counter()-t0)*1000
+                t0 = time.perf_counter(); obs = robot.get_observation(); om = (time.perf_counter()-t0)*1000
+                obs_t = time.perf_counter()
+                with _control_lock:
+                    _control_state["observation"] = obs; _control_state["obs_t"] = obs_t; _control_state["seq"] = seq
+                if state_socket is not None:
+                    sf = {f"observation.{n}": v for n, v in obs.items()}
+                    if action is not None:
+                        for n, v in action.items(): sf[f"action.{n}"] = v
+                    try: state_socket.send_pyobj({"type":"state","frame":sf,"t":obs_t}, flags=zmq.NOBLOCK)
+                    except Exception: pass
+                if control_log is not None and args.control_log_every_n > 0 and seq % args.control_log_every_n == 0:
+                    control_log.log({"event":"control_tick","seq":seq,"tick_start":t0,"action_sent":action,"state":obs,"send_ms":sm,"obs_ms":om})
+            except Exception as e:
+                logger.warning("Control loop I/O error: %s", e, exc_info=True)
+
+            # Stats
+            now = time.perf_counter()
+            if now - last_stats_t >= 2.0:
+                dt = now - last_stats_t
+                logger.info("Control stats: motor=%.1f/s targets=%d/s updates=%d/s",
+                            seq/dt, tx_msgs/dt, tx_updates/dt)
+                seq = 0; tx_msgs = 0; tx_updates = 0; last_stats_t = now
+
+            next_tick += period
+            sleep_s = next_tick - time.perf_counter()
+            if sleep_s <= 0: next_tick = time.perf_counter()
+            else: _control_stop.wait(sleep_s)
+
+    _control_thread = _th2.Thread(target=_control_loop, daemon=True, name="control")
+    _control_thread.start()
+
     # ── Build features for setup message ──
     features = {}
     for side in sides:
         for joint in SO101_JOINT_NAMES:
             features[f"observation.{side}_{joint}.pos"] = {"dtype": "float32", "shape": (1,), "names": None}
-    for name in caps:
-        features[f"observation.images.{name}"] = {"dtype": "video", "shape": (3,), "names": ["channels", "height", "width"]}
+    for name, cfg in camera_configs.items():
+        h, w = cfg.get("height", 480), cfg.get("width", 640)
+        features[f"observation.images.{name}"] = {"dtype": "video", "shape": (h, w, 3), "names": ["height", "width", "channels"]}
 
     setup_msg = {
         "type": "setup", "fps": args.fps, "features": features,
@@ -210,9 +318,7 @@ def main():
 
     latest_target: Optional[dict] = None
     last_setup_resend = time.perf_counter()
-    previous_action: Optional[dict] = None
     period = 1.0 / args.fps
-    control_period = 1.0 / args.control_fps
 
     try:
         while True:
@@ -227,47 +333,19 @@ def main():
             except zmq.Again:
                 pass
 
-            # Receive latest joint target from PC (non-blocking, take newest)
-            try:
-                while True:
-                    target = target_socket.recv_pyobj(flags=zmq.NOBLOCK)
-                    if isinstance(target, dict) and target.get("__hold__"):
-                        latest_target = None
-                        previous_action = None
-                    else:
-                        latest_target = target
-            except zmq.Again:
-                pass
+            # Get latest observation from control thread
+            with _control_lock:
+                obs = dict(_control_state["observation"]) if _control_state["observation"] is not None else None
+                action = _control_state.get("action")
+            if obs is None:
+                busy_wait(max(0, period - (time.perf_counter() - loop_start)))
+                continue
+            # Update latest_target for setup resend logic
+            if action is not None:
+                latest_target = {k.replace(".pos", ""): v for k, v in action.items()}
+            else:
+                latest_target = None
 
-            # Send action to hardware. Interpolation is optional; PC IK defaults to 60Hz.
-            if latest_target is not None:
-                # Convert PC format {left_shoulder_pan: deg} → LeRobot format {left_shoulder_pan.pos: deg}
-                action = {f"{k}.pos": float(v) for k, v in latest_target.items()}
-
-                if not args.interpolate_actions or previous_action is None:
-                    try:
-                        robot.send_action(action)
-                    except Exception as e:
-                        logger.warning("Motor write error: %s", e)
-                    previous_action = action
-                else:
-                    remaining = max(0, period - (time.perf_counter() - loop_start))
-                    num_steps = max(1, int(round(remaining * args.control_fps)))
-                    step_s = remaining / num_steps
-
-                    for step in range(1, num_steps + 1):
-                        step_start = time.perf_counter()
-                        alpha = step / num_steps
-                        interp = interpolate_action(previous_action, action, alpha)
-                        try:
-                            robot.send_action(interp)
-                        except Exception as e:
-                            logger.warning("Motor write error: %s", e)
-                        previous_action = interp
-                        busy_wait(max(0, step_s - (time.perf_counter() - step_start)))
-
-            # Build and send observation frame at fps rate
-            obs = robot.get_observation()
             frame = {}
             for k, v in obs.items():
                 frame[f"observation.{k}"] = v
@@ -297,13 +375,14 @@ def main():
         logger.info("Interrupted.")
     finally:
         obs_socket.send_pyobj({"type": "done"})
+        _control_stop.set()
+        _control_thread.join(timeout=2)
         robot.disconnect()
-        for cap in caps.values():
-            cap.release()
-        obs_socket.close(0)
-        target_socket.close(0)
-        cmd_socket.close(0)
+        for cap in caps.values(): cap.release()
+        if state_socket is not None: state_socket.close(0)
+        obs_socket.close(0); target_socket.close(0); cmd_socket.close(0)
         ctx.term()
+        if control_log is not None: control_log.stop()
         logger.info("Shutdown complete.")
 
 

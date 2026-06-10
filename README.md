@@ -1,4 +1,4 @@
-# XRoboToolkit Teleop 在 Ubuntu 20.04 + PICO 上的安装与验证记录
+# XRoboToolkit Teleop 在 Ubuntu 20.04 + PICO 上的安装
 
 本文记录在 **Ubuntu 20.04** 上尝试安装并运行 `XRoboToolkit-Teleop-Sample-Python`，并连接 **PICO / XRoboToolkit** 进行遥操作验证的完整过程。
 

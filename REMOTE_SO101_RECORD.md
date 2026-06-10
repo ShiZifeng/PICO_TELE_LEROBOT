@@ -6,7 +6,7 @@ Jetson 负责硬件控制 + 相机采集，PC 负责 XR 遥操作 + IK + LeRobot
 
 | 设备 | IP | 角色 |
 |------|-----|------|
-| PC | 192.168.50.101 | XR + IK + 录制 + MJPEG 推流 |
+| PC | 192.168.50.75 | XR + IK + 录制 + MJPEG 推流 |
 | Jetson | 192.168.50.47 | 机械臂控制 + 相机采集 |
 | PICO | 同一局域网 | XR 手柄追踪 |
 
@@ -14,10 +14,13 @@ Jetson 负责硬件控制 + 相机采集，PC 负责 XR 遥操作 + IK + LeRobot
 
 | 端口 | 方向 | 协议 | 内容 |
 |------|------|------|------|
-| 5570 | Jetson → PC | ZMQ PUSH/PULL | 观测数据（关节+相机） |
-| 5580 | PC → Jetson | ZMQ PUB/SUB | IK 关节目标 |
+| 5570 | Jetson → PC | ZMQ PUSH/PULL | 观测数据（关节+相机，15Hz 录制用） |
+| 5580 | PC → Jetson | ZMQ PUB/SUB | IK 关节目标（60Hz） |
 | 5571 | PC → Jetson | ZMQ PUB/SUB | 控制命令 (stop) |
-| 8080 | PC → PICO | HTTP | MJPEG 相机画面 |
+| 5572 | Jetson → PC | ZMQ PUSH/PULL | 高频关节状态回传（60Hz，IK 用） |
+| 8080 | PC → PICO | HTTP | MJPEG 相机画面（浏览器） |
+| 13579 | PICO → PC | TCP | 控制通道（APK 发送启动命令） |
+| 12345 | PC → PICO | TCP | H.264 视频流（PC 连接 PICO 推送） |
 
 ---
 
@@ -65,21 +68,23 @@ conda activate szf_lerobot
 cd ~/szf_lerobot
 
 python scripts/teleop_so101_remote_jetson.py \
-  --pc-ip 192.168.50.101 \
+  --pc-ip 192.168.50.75 \
   --ports '{"left": "/dev/left_follower_mobile", "right": "/dev/right_follower_mobile"}' \
   --cameras '{
     "left_arm": {"type": "opencv", "index": 10, "width": 640, "height": 480, "fps": 30},
     "right_arm": {"type": "opencv", "index": 8, "width": 640, "height": 480, "fps": 30},
-    "head": {"type": "opencv", "index": 0, "width": 640, "height": 480, "fps": 30}
+    "head": {"type": "opencv", "index": 0, "width": 1280, "height": 720, "fps": 30}
   }' \
-  --fps 60 \
+  --fps 15 \
   --control-fps 60 \
-  --jpeg-quality 80
+  --jpeg-quality 95 \
+  --state-port 5572 \
+  --control-log logs/jetson_control_$(date +%Y%m%d_%H%M%S).jsonl
 ```
 
 看到 `Ready. Waiting for joint targets from PC...` 即启动成功。
 
-Jetson 端默认直接发送 PC 端 60Hz IK 目标，不再做本地插值；如需恢复旧插值行为，可额外加 `--interpolate-actions`。
+Jetson 端按 `--fps` 采样一帧 state/action，并用本周期剩余时间把该帧 action 按 `--control-fps` 插值发送给电机，然后采集相机并回传这一帧数据。默认建议保持 `--fps 15 --control-fps 60 --interpolate-actions`，这样数据集里的 action/state 时间戳语义和未来 15Hz 模型部署一致。
 
 > **安全提示**：第一次建议加 `--max-relative-target 3.0` 限制舵机每步最大移动量。
 
@@ -94,7 +99,7 @@ Jetson 端默认直接发送 PC 端 60Hz IK 目标，不再做本地插值；如
 
 1. PICO 开机 → 打开 XRoboToolkit app
 2. 确认 PICO 和 PC 在同一局域网
-3. 如需要，填入 PC IP `192.168.50.101`
+3. 如需要，填入 PC IP `192.168.50.75`
 
 ## 6. PC 端启动 XR 遥操作 + 录制
 
@@ -109,8 +114,10 @@ python scripts/hardware/teleop_so101_remote_pc.py \
   --repo-id local/so101_dual_xr_teleop \
   --mode dual \
   --scale-factor 1.0 \
+  --ik-control-mode position_wrist \
   --xr-frame simulation \
-  --mjpeg-port 8080
+  --h264-port 12345 \
+  --state-port 5572
 
 # 单臂模式
 python scripts/hardware/teleop_so101_remote_pc.py \
@@ -118,7 +125,9 @@ python scripts/hardware/teleop_so101_remote_pc.py \
   --repo-id local/so101_xr_teleop \
   --mode single \
   --scale-factor 1.0 \
-  --xr-frame simulation
+  --xr-frame simulation \
+  --h264-port 12345 \
+  --state-port 5572
 ```
 
 如果感觉手柄前后/左右方向不对，先不要连机械臂调 IK，单独跑 XR 轴向调试：
@@ -173,8 +182,34 @@ python scripts/hardware/debug_xr_axis_mapping.py --controller right
 
 ## 7. PICO 查看相机画面
 
+### 方式 A：APK Remote Vision（推荐 — H.264 低延迟）
+
+启动 PC 端时加 `--h264-port 12345`（默认开启）：
+
+```bash
+python scripts/hardware/teleop_so101_remote_pc.py \
+  --listen-ip 0.0.0.0 \
+  --repo-id local/so101_dual_xr_teleop \
+  --mode dual \
+  --h264-port 12345
 ```
-PICO 浏览器 → http://192.168.50.101:8080
+
+然后在 PICO APK 中：
+1. 打开 **Remote Vision** 面板
+2. 在 **Video Source** 下拉中选择 **ZEDMINI**（外部 PC 推流）
+3. 点击 **Listen** 按钮
+4. APK 先连接 PC 的控制端口 `13579` 发送 CameraRequest；PC 收到请求后再连接 PICO 请求中的视频端口并推送 H.264 视频流
+
+> **注意**：`PICO4U` 选项是 PICO 自带摄像头独立模式；外部 PC/Jetson 推流时选 `ZEDMINI`。
+
+> 参数调整：`--h264-width 1280 --h264-height 720 --h264-fps 60 --h264-bitrate 8000000`
+
+> **画质调优**：如果视频模糊，优先提高 `--h264-bitrate`（默认 8Mbps，可调到 12M-16M）；Jetson 端 `--jpeg-quality` 建议 95（减少二次压缩损失）。
+
+### 方式 B：PICO 浏览器（MJPEG 兼容）
+
+```
+PICO 浏览器 → http://192.168.50.75:8080
 ```
 
 三个相机窗口并排显示。可在浏览器中调整窗口大小。
@@ -258,8 +293,8 @@ python -m lerobot.scripts.visualize_ee_trajectory \
 
 在 Jetson 上测试端口：
 ```bash
-nc -vz 192.168.50.101 5570
-nc -vz 192.168.50.101 5580
+nc -vz 192.168.50.75 5570
+nc -vz 192.168.50.75 5580
 ```
 
 如果连不上，检查：

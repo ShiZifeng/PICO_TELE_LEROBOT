@@ -1,14 +1,16 @@
 {
     "codebase_version": "v2.1",
     "robot_type": "so101_follower_dual",
-    "total_episodes": 0,
-    "total_frames": 0,
-    "total_tasks": 0,
-    "total_videos": 0,
-    "total_chunks": 0,
+    "total_episodes": 2,
+    "total_frames": 539,
+    "total_tasks": 1,
+    "total_videos": 6,
+    "total_chunks": 1,
     "chunks_size": 1000,
-    "fps": 30,
-    "splits": {},
+    "fps": 15,
+    "splits": {
+        "train": "0:2"
+    },
     "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
     "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
     "features": {
@@ -99,35 +101,71 @@
         "observation.images.left_arm": {
             "dtype": "video",
             "shape": [
+                480,
+                640,
                 3
             ],
             "names": [
-                "channels",
                 "height",
-                "width"
-            ]
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 15,
+                "video.channels": 3,
+                "has_audio": false
+            }
         },
         "observation.images.right_arm": {
             "dtype": "video",
             "shape": [
+                480,
+                640,
                 3
             ],
             "names": [
-                "channels",
                 "height",
-                "width"
-            ]
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 15,
+                "video.channels": 3,
+                "has_audio": false
+            }
         },
         "observation.images.head": {
             "dtype": "video",
             "shape": [
+                720,
+                1280,
                 3
             ],
             "names": [
-                "channels",
                 "height",
-                "width"
-            ]
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 720,
+                "video.width": 1280,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 15,
+                "video.channels": 3,
+                "has_audio": false
+            }
         },
         "timestamp": {
             "dtype": "float32",
