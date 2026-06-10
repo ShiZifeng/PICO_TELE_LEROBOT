@@ -450,32 +450,26 @@ class XRIKController:
             else:
                 return {}
 
-        # ── Homing check: Y → left arm, B/right_menu → right arm ──
-        # B may be intercepted by PICO system; right_menu_button as fallback.
-        y_down = False; b_down = False; right_menu_down = False
+        # ── Homing check: Y → left arm, B → right arm ──
+        y_down = False; b_down = False
         try:
             y_down = self.xr_client.get_button_state_by_name("Y")
             b_down = self.xr_client.get_button_state_by_name("B")
-            right_menu_down = self.xr_client.get_button_state_by_name("right_menu_button")
         except Exception:
             pass
 
         y_edge = y_down and not self._homing_y_was_down
-        right_home_edge = (b_down or right_menu_down) and not self._homing_b_was_down
+        b_edge = b_down and not self._homing_b_was_down
         self._homing_y_was_down = y_down
-        self._homing_b_was_down = (b_down or right_menu_down)
+        self._homing_b_was_down = b_down
 
         if not self._homing_sides:
             if y_edge:
                 logger.info("Homing trigger: Y → left arm")
                 self._start_homing({"left"})
-            if right_home_edge and not self._homing_sides:
-                trigger = "B" if b_down else "right_menu"
-                logger.info("Homing trigger: %s → right arm", trigger)
+            if b_edge and not self._homing_sides:
+                logger.info("Homing trigger: B → right arm")
                 self._start_homing({"right"})
-            if (y_down or b_down or right_menu_down) and not self._homing_sides:
-                logger.info("Homing: Y=%s B=%s menu=%s (held, waiting release)",
-                            y_down, b_down, right_menu_down)
 
         if self._homing_sides:
             return self._homing_step()
