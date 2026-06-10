@@ -371,35 +371,57 @@ class XRIKController:
                             self.placo_robot.state.q[q_idx] = float(np.radians(value))
         self._has_robot_state = True
 
+    def _clear_xr_reference_for_hand(self, name: str):
+        self.ref_ee_xyz[name] = None
+        self.ref_ee_quat[name] = None
+        self.ref_controller_xyz[name] = None
+        self.ref_controller_quat[name] = None
+        self.active[name] = False
+
+        self.ref_wrist_pitch_elevation_rad.pop(name, None)
+        self.ref_wrist_pitch_horizontal_world.pop(name, None)
+        self.desired_wrist_pitch_elevation_rad.pop(name, None)
+        self.last_wrist_pitch_elevation_rad.pop(name, None)
+        self.direct_wrist_roll_target_rad.pop(name, None)
+        self.wrist_xyz_target_world.pop(name, None)
+
+
+    def _clear_target_cache_for_side(self, side: str):
+        prefix = f"{side}_"
+        for cache_name in [
+            "_last_published_target_deg",
+            "_filtered_target_deg",
+            "_last_raw_target_deg",
+            "_last_filtered_target_deg",
+            "_last_output_target_deg",
+        ]:
+            cache = getattr(self, cache_name)
+            for k in list(cache.keys()):
+                if k.startswith(prefix):
+                    cache.pop(k, None)
+
     def _start_homing(self, side: str):
-        """Begin smooth homing for one arm (idempotent — can add while other arm is homing)."""
         if side in self._homing_sides:
-            return  # already homing this arm
+            return
+
         self._homing_sides.add(side)
+
         if len(self._homing_sides) == 1:
             self._homing_start_time = time.perf_counter()
-            self._reset_xr_references()
             self._safety_paused = False
             self._ik_failure_count = 0
-            self._last_published_target_deg = {}
-            self._filtered_target_deg = {}
-            self._last_raw_target_deg = {}
-            self._last_filtered_target_deg = {}
-            self._last_output_target_deg = {}
-        # Always snapshot current observed positions (may differ between arms)
+
+        hand_name = f"{side}_hand"
+        self._clear_xr_reference_for_hand(hand_name)
+        self._clear_target_cache_for_side(side)
+
         self._homing_start_positions_deg.update(self._latest_observed_motor_deg)
-        sample_keys = [k for k in self._homing_start_positions_deg if k.startswith(side)]
-        logger.info("Homing started for %s (sample=%s)",
-                    side, {k: round(self._homing_start_positions_deg.get(k, 0), 1) for k in sample_keys[:3]})
 
     def _homing_step(self) -> Dict[str, float]:
-        """Produce one tick of homing interpolation for the homed side(s) only.
-        Returns only the homed arm's targets — non-homed arms continue via IK."""
         elapsed = time.perf_counter() - self._homing_start_time
         duration = self._homing_duration
 
-        t = elapsed / duration
-        t = max(0.0, min(1.0, t))
+        t = max(0.0, min(1.0, elapsed / duration))
         alpha = t * t * (3.0 - 2.0 * t)
 
         targets = {}
@@ -409,20 +431,12 @@ class XRIKController:
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
                 targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
-        if alpha < 0.02:
-            logger.info("Homing %s: alpha=%.3f, targets=%d keys",
-                        sorted(self._homing_sides), alpha, len(targets))
 
         if elapsed >= duration:
             self._homing_sides.clear()
             logger.info("Homing complete (%.1fs).", elapsed)
 
-        self._last_raw_target_deg = dict(targets)
-        filtered = self._filter_target(targets)
-        clipped = self._clip_target_step(filtered)
-        clipped = self._clip_motor_joint_limits(clipped)
-        self._last_output_target_deg = dict(clipped)
-        return clipped
+        return targets
 
     def step(self) -> Dict[str, float]:
         """Run one IK step (matches BaseTeleopController._update_ik)."""
@@ -461,10 +475,13 @@ class XRIKController:
             self._start_homing("right")
 
         # Compute homing overrides (does NOT return early — IK continues for other arms)
+        homing_sides_before = set(self._homing_sides)
+
         homing_overrides: Dict[str, float] = {}
-        if self._homing_sides:
+        if homing_sides_before:
             homing_overrides = self._homing_step()
-        _homing_hands = {f"{s}_hand" for s in self._homing_sides}
+
+        _homing_hands = {f"{s}_hand" for s in homing_sides_before}
 
         # 1. Update kinematics from current robot state (set by update_robot_state)
         self.placo_robot.update_kinematics()
