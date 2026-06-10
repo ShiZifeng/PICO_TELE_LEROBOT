@@ -282,13 +282,16 @@ class XRIKController:
         self._last_workspace_clip_log_t = 0.0
 
         # ── Homing state ──
-        # Y or B button triggers smooth homing to a neutral resting pose.
-        self._homing_active = False
+        # Y/B button triggers smooth homing to a neutral resting pose.
+        #   left grip + Y  → home left arm only
+        #   right grip + B → home right arm only
+        #   Y or B alone   → home both arms
+        self._homing_sides: set = set()  # empty = inactive, {"left"} / {"right"} / {"left","right"}
         self._homing_start_time = 0.0
         self._homing_duration = 2.0  # seconds (smoothstep eased)
         self._homing_start_positions_deg: Dict[str, float] = {}
-        self._homing_button_was_down = False
-        self._homing_button_name = "Y"  # also checks B as alternative
+        self._homing_y_was_down = False
+        self._homing_b_was_down = False
         # Neutral home pose (motor degrees). Per-side values from observed resting pose.
         self._home_pose_deg = {
             "left": {
@@ -371,9 +374,9 @@ class XRIKController:
                             self.placo_robot.state.q[q_idx] = float(np.radians(value))
         self._has_robot_state = True
 
-    def _start_homing(self):
+    def _start_homing(self, sides: set):
         """Begin smooth homing from current observed positions to neutral pose."""
-        self._homing_active = True
+        self._homing_sides = sides
         self._homing_start_time = time.perf_counter()
         self._reset_xr_references()
         self._safety_paused = False
@@ -386,24 +389,13 @@ class XRIKController:
         self._last_raw_target_deg = {}
         self._last_filtered_target_deg = {}
         self._last_output_target_deg = {}
+        side_str = ",".join(sorted(sides)) if sides else "both"
+        logger.info("Homing started for %s", side_str)
 
     def _homing_step(self) -> Dict[str, float]:
         """Produce one tick of homing interpolation (smoothstep eased)."""
         elapsed = time.perf_counter() - self._homing_start_time
         duration = self._homing_duration
-
-        if elapsed >= duration:
-            # Homing complete — hold at exact home position
-            self._homing_active = False
-            targets = {}
-            for side in self.sides:
-                side_pose = self._home_pose_deg.get(side, self._home_pose_deg.get("right", {}))
-                for joint, home_deg in side_pose.items():
-                    targets[f"{side}_{joint}"] = home_deg
-            logger.info("Homing complete (%.1fs). Holding at home pose.", elapsed)
-            self._last_raw_target_deg = dict(targets)
-            self._last_output_target_deg = dict(targets)
-            return targets
 
         # Smoothstep easing: t^2 * (3 - 2t) → smooth accel/decel
         t = elapsed / duration
@@ -411,12 +403,16 @@ class XRIKController:
         alpha = t * t * (3.0 - 2.0 * t)
 
         targets = {}
-        for side in self.sides:
-            side_pose = self._home_pose_deg.get(side, self._home_pose_deg.get("right", {}))
+        for side in self._homing_sides:
+            side_pose = self._home_pose_deg.get(side, {})
             for joint, home_deg in side_pose.items():
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
                 targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
+
+        if elapsed >= duration:
+            self._homing_sides.clear()
+            logger.info("Homing complete (%.1fs). Holding at home pose.", elapsed)
 
         self._last_raw_target_deg = dict(targets)
         filtered = self._filter_target(targets)
@@ -441,21 +437,37 @@ class XRIKController:
             else:
                 return {}
 
-        # ── Homing check (Y or B button edge) ──
-        homing_pressed = False
+        # ── Homing check (Y/B button edge, per-side via grip combo) ──
+        #   left grip + Y  → home left arm only
+        #   right grip + B → home right arm only
+        #   Y or B alone   → home both arms
+        y_down = False; b_down = False
+        left_grip = False; right_grip = False
         try:
-            homing_pressed = (
-                self.xr_client.get_button_state_by_name(self._homing_button_name)
-                or self.xr_client.get_button_state_by_name("B")
-            )
+            y_down = self.xr_client.get_button_state_by_name("Y")
+            b_down = self.xr_client.get_button_state_by_name("B")
+            left_grip = self.xr_client.get_key_value_by_name("left_grip") > 0.5
+            right_grip = self.xr_client.get_key_value_by_name("right_grip") > 0.5
         except Exception:
             pass
-        if homing_pressed and not self._homing_button_was_down and not self._homing_active:
-            self._start_homing()
-            logger.info("Homing started (target: %s)", self._home_pose_deg)
-        self._homing_button_was_down = homing_pressed
 
-        if self._homing_active:
+        y_edge = y_down and not self._homing_y_was_down
+        b_edge = b_down and not self._homing_b_was_down
+        self._homing_y_was_down = y_down
+        self._homing_b_was_down = b_down
+
+        if not self._homing_sides and (y_edge or b_edge):
+            sides = set()
+            if y_edge and left_grip:
+                sides.add("left")
+            elif b_edge and right_grip:
+                sides.add("right")
+            else:
+                sides = {"left", "right"} if self.mode == "dual" else {"right"}
+            if sides:
+                self._start_homing(sides)
+
+        if self._homing_sides:
             return self._homing_step()
 
         # 1. Update kinematics from current robot state (set by update_robot_state)
@@ -1189,10 +1201,11 @@ class XRIKController:
             "active": dict(self.active),
             "xr_confirmed": bool(self.xr_confirmed),
             "safety_paused": bool(self._safety_paused),
-            "homing_active": bool(self._homing_active),
+            "homing_active": bool(self._homing_sides),
+            "homing_sides": sorted(self._homing_sides),
             "homing_progress": float(
                 min(1.0, (time.perf_counter() - self._homing_start_time) / self._homing_duration)
-            ) if self._homing_active else 0.0,
+            ) if self._homing_sides else 0.0,
         }
 
     def _process_xr(self, xr_pose, src_name):
@@ -1710,7 +1723,8 @@ def main():
         logger.warning("pynput not available; keyboard control disabled.")
         listener = None
 
-    logger.info("Controls: XR %s/Space=rec, R=discard, Q/Esc=quit, Y/B=home arms", args.xr_record_button)
+    logger.info("Controls: XR %s/Space=rec, R=discard, Q/Esc=quit", args.xr_record_button)
+    logger.info("  Home: Y=both arms, L.grip+Y=left arm, R.grip+B=right arm")
 
     # ── Main loop: receive observations ──
     try:
