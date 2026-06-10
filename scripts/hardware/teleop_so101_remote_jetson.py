@@ -300,6 +300,7 @@ def main():
     for side in sides:
         for joint in SO101_JOINT_NAMES:
             features[f"observation.{side}_{joint}.pos"] = {"dtype": "float32", "shape": (1,), "names": None}
+            features[f"action.{side}_{joint}.pos"] = {"dtype": "float32", "shape": (1,), "names": None}
     for name, cfg in camera_configs.items():
         h, w = cfg.get("height", 480), cfg.get("width", 640)
         features[f"observation.images.{name}"] = {"dtype": "video", "shape": (h, w, 3), "names": ["height", "width", "channels"]}
@@ -349,6 +350,18 @@ def main():
             frame = {}
             for k, v in obs.items():
                 frame[f"observation.{k}"] = v
+            # Add action (latest PC IK target) — aligns with lerobot dataset format.
+            # Always produce a complete action dict for every joint; fall back to
+            # the corresponding observation value during idle / hold periods so
+            # that validate_frame never sees missing action keys.
+            for side in sides:
+                for joint in SO101_JOINT_NAMES:
+                    action_key = f"{side}_{joint}.pos"
+                    frame_key = f"action.{action_key}"
+                    if action is not None and action_key in action:
+                        frame[frame_key] = action[action_key]
+                    else:
+                        frame[frame_key] = obs.get(action_key, 0.0)
             # Add camera frames
             images = read_cameras(caps)
             for name, img in images.items():
