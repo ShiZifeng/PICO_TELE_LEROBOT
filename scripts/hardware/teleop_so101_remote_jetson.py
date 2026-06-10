@@ -335,6 +335,9 @@ def main():
                 args.control_fps, args.fps, _ticks_per_record)
 
     last_setup_resend = time.perf_counter()
+    frame_count = 0
+    last_frame_log_t = time.perf_counter()
+    _first_frame_sent = False
 
     try:
         while True:
@@ -350,6 +353,7 @@ def main():
                 # If no observation yet, keep waiting
                 if obs is None:
                     continue
+            frame_count += 1
 
             # Check for stop command (non-blocking, outside lock)
             try:
@@ -376,12 +380,28 @@ def main():
             encoded = encode_frame(frame, image_keys, args.jpeg_quality)
             try:
                 obs_socket.send_pyobj({"type": "frame", "frame": encoded}, flags=zmq.NOBLOCK)
+                if not _first_frame_sent:
+                    _first_frame_sent = True
+                    logger.info("First frame sent. obs.state=%s action=%s",
+                                np.round(frame.get("observation.state", np.empty(0)), 1).tolist(),
+                                np.round(frame.get("action", np.empty(0)), 1).tolist())
             except zmq.Again:
                 pass
 
-            # Re-send setup every 2s unconditionally until a frame has been
-            # sent successfully (guards against ZMQ NOBLOCK drop at startup).
+            # Periodic record log (every ~30 frames / 2s at 15Hz)
             now = time.perf_counter()
+            if now - last_frame_log_t >= 2.0:
+                dt = now - last_frame_log_t
+                obs_val = frame.get("observation.state", np.empty(0))
+                act_val = frame.get("action", np.empty(0))
+                logger.info("Record: %.1f fps (%d frames), obs[0]=%.1f act[0]=%.1f",
+                            frame_count / max(dt, 0.001), frame_count,
+                            float(obs_val[0]) if len(obs_val) > 0 else -1,
+                            float(act_val[0]) if len(act_val) > 0 else -1)
+                frame_count = 0
+                last_frame_log_t = now
+
+            # Re-send setup every 2s unconditionally (guards against ZMQ NOBLOCK drop at startup)
             if now - last_setup_resend > 2.0:
                 try:
                     obs_socket.send_pyobj(setup_msg, flags=zmq.NOBLOCK)
