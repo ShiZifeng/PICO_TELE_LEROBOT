@@ -282,11 +282,8 @@ class XRIKController:
         self._last_workspace_clip_log_t = 0.0
 
         # ── Homing state ──
-        # Y/B button triggers smooth homing to a neutral resting pose.
-        #   left grip + Y  → home left arm only
-        #   right grip + B → home right arm only
-        #   Y or B alone   → home both arms
-        self._homing_sides: set = set()  # empty = inactive, {"left"} / {"right"} / {"left","right"}
+        # Y → home left arm, B → home right arm (single-key, per-arm)
+        self._homing_sides: set = set()  # empty = inactive, {"left"} / {"right"}
         self._homing_start_time = 0.0
         self._homing_duration = 2.0  # seconds (smoothstep eased)
         self._homing_start_positions_deg: Dict[str, float] = {}
@@ -437,17 +434,11 @@ class XRIKController:
             else:
                 return {}
 
-        # ── Homing check (Y/B button edge, per-side via grip combo) ──
-        #   left grip + Y  → home left arm only
-        #   right grip + B → home right arm only
-        #   Y or B alone   → home both arms
+        # ── Homing check: Y → left arm, B → right arm ──
         y_down = False; b_down = False
-        left_grip = False; right_grip = False
         try:
             y_down = self.xr_client.get_button_state_by_name("Y")
             b_down = self.xr_client.get_button_state_by_name("B")
-            left_grip = self.xr_client.get_key_value_by_name("left_grip") > 0.5
-            right_grip = self.xr_client.get_key_value_by_name("right_grip") > 0.5
         except Exception:
             pass
 
@@ -456,16 +447,11 @@ class XRIKController:
         self._homing_y_was_down = y_down
         self._homing_b_was_down = b_down
 
-        if not self._homing_sides and (y_edge or b_edge):
-            sides = set()
-            if y_edge and left_grip:
-                sides.add("left")
-            elif b_edge and right_grip:
-                sides.add("right")
-            else:
-                sides = {"left", "right"} if self.mode == "dual" else {"right"}
-            if sides:
-                self._start_homing(sides)
+        if not self._homing_sides:
+            if y_edge:
+                self._start_homing({"left"})
+            elif b_edge:
+                self._start_homing({"right"})
 
         if self._homing_sides:
             return self._homing_step()
@@ -1724,7 +1710,7 @@ def main():
         listener = None
 
     logger.info("Controls: XR %s/Space=rec, R=discard, Q/Esc=quit", args.xr_record_button)
-    logger.info("  Home: Y=both arms, L.grip+Y=left arm, R.grip+B=right arm")
+    logger.info("  Home: Y=left arm, B=right arm")
 
     # ── Main loop: receive observations ──
     try:
