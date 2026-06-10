@@ -296,11 +296,16 @@ def main():
     _control_thread.start()
 
     # ── Build features for setup message ──
-    features = {}
+    # Use aggregated "action" / "observation.state" format aligned with lerobot's
+    # hw_to_dataset_features, so downstream training pipelines see the standard schema.
+    joint_names = []
     for side in sides:
         for joint in SO101_JOINT_NAMES:
-            features[f"observation.{side}_{joint}.pos"] = {"dtype": "float32", "shape": (1,), "names": None}
-            features[f"action.{side}_{joint}.pos"] = {"dtype": "float32", "shape": (1,), "names": None}
+            joint_names.append(f"{side}_{joint}.pos")
+
+    features = {}
+    features["action"] = {"dtype": "float32", "shape": (len(joint_names),), "names": joint_names}
+    features["observation.state"] = {"dtype": "float32", "shape": (len(joint_names),), "names": joint_names}
     for name, cfg in camera_configs.items():
         h, w = cfg.get("height", 480), cfg.get("width", 640)
         features[f"observation.images.{name}"] = {"dtype": "video", "shape": (h, w, 3), "names": ["height", "width", "channels"]}
@@ -348,20 +353,15 @@ def main():
                 latest_target = None
 
             frame = {}
-            for k, v in obs.items():
-                frame[f"observation.{k}"] = v
-            # Add action (latest PC IK target) — aligns with lerobot dataset format.
-            # Always produce a complete action dict for every joint; fall back to
-            # the corresponding observation value during idle / hold periods so
-            # that validate_frame never sees missing action keys.
-            for side in sides:
-                for joint in SO101_JOINT_NAMES:
-                    action_key = f"{side}_{joint}.pos"
-                    frame_key = f"action.{action_key}"
-                    if action is not None and action_key in action:
-                        frame[frame_key] = action[action_key]
-                    else:
-                        frame[frame_key] = obs.get(action_key, 0.0)
+            # Build aggregated observation.state (aligned with lerobot format)
+            obs_values = [obs.get(name, 0.0) for name in joint_names]
+            frame["observation.state"] = np.array(obs_values, dtype=np.float32)
+            # Build aggregated action (latest PC IK target), fall back to observation
+            action_values = [
+                action[name] if (action is not None and name in action) else obs.get(name, 0.0)
+                for name in joint_names
+            ]
+            frame["action"] = np.array(action_values, dtype=np.float32)
             # Add camera frames
             images = read_cameras(caps)
             for name, img in images.items():
