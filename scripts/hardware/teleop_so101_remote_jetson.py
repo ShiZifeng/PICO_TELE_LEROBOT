@@ -228,13 +228,14 @@ def main():
 
     # ── Control thread (60Hz): send_action + read obs + state_tx + log ──
     import threading as _th2
+    import queue as _queue
     _control_state = {"action": None, "observation": None, "obs_t": 0.0, "seq": 0}
     _control_lock = _th2.Lock()
     _control_stop = _th2.Event()
-    # Condition: control thread signals main loop every control_fps/fps ticks
-    _record_condition = _th2.Condition(_control_lock)
-    _record_ready = False
     _ticks_per_record = max(1, int(round(args.control_fps / args.fps)))  # e.g. 60/15 = 4
+    # Queue-based signal: control thread pushes token every N ticks, main loop pops.
+    # More reliable than threading.Condition across Python versions / platforms.
+    _record_signal = _queue.Queue(maxsize=1)
 
     def _control_loop():
         period = 1.0 / args.control_fps
@@ -273,12 +274,14 @@ def main():
                 obs_t = time.perf_counter()
                 with _control_lock:
                     _control_state["observation"] = obs; _control_state["obs_t"] = obs_t; _control_state["seq"] = seq
-                    # Signal main loop every Nth tick (non-blocking for control thread)
+                    # Signal main loop every Nth tick via Queue (non-blocking)
                     if seq % _ticks_per_record == 0:
-                        _record_ready = True
-                        _record_condition.notify()
-                        if seq <= 8:  # log first two notify events
-                            logger.info("Notified record loop (seq=%d, obs=%s, action=%s)",
+                        try:
+                            _record_signal.put_nowait(True)
+                        except _queue.Full:
+                            pass
+                        if seq <= 8:
+                            logger.info("Signalled record loop (seq=%d, obs=%s, action=%s)",
                                         seq, bool(obs), bool(action))
                 if state_socket is not None:
                     sf = {f"observation.{n}": v for n, v in obs.items()}
@@ -345,21 +348,23 @@ def main():
     try:
         while True:
             # ── Wait for control thread to signal a record tick ──
-            with _record_condition:
-                while not _record_ready and not _control_stop.is_set():
-                    _record_condition.wait(timeout=0.5)
+            try:
+                _record_signal.get(timeout=0.5)
+            except _queue.Empty:
                 if _control_stop.is_set():
                     break
-                obs = dict(_control_state["observation"])
+                continue
+
+            with _control_lock:
+                obs = dict(_control_state["observation"]) if _control_state["observation"] is not None else None
                 action = _control_state.get("action")
-                _wake_seq = _control_state["seq"]
-                if _wake_seq <= 12:  # log first few wake-ups
-                    logger.info("Main loop woke at seq=%d, obs=%s, action=%s",
-                                _wake_seq, bool(obs), bool(action))
-                _record_ready = False
-                # If no observation yet, keep waiting
-                if obs is None:
-                    continue
+                wake_seq = _control_state["seq"]
+            if wake_seq <= 12:
+                logger.info("Main loop woke at seq=%d, obs=%s, action=%s",
+                            wake_seq, bool(obs), bool(action))
+            if obs is None:
+                continue
+
             frame_count += 1
 
             # Check for stop command (non-blocking, outside lock)
