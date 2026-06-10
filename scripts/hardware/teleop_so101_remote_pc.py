@@ -406,22 +406,26 @@ class XRIKController:
         alpha = t * t * (3.0 - 2.0 * t)
 
         targets = {}
-        for side in self._homing_sides:
+        # Fill ALL joints: homed sides interpolate, others hold observed position
+        for side in self.sides:
             side_pose = self._home_pose_deg.get(side, {})
-            if not side_pose:
-                logger.warning("Homing: no home pose for side '%s'", side)
-                continue
+            homing = side in self._homing_sides
             for joint, home_deg in side_pose.items():
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
-                targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
+                if homing:
+                    targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
+                else:
+                    targets[motor_name] = float(start_deg)  # hold
         if alpha < 0.02:
             logger.info("Homing %s: alpha=%.3f, targets=%d keys",
                         sorted(self._homing_sides), alpha, len(targets))
 
         if elapsed >= duration:
             self._homing_sides.clear()
-            logger.info("Homing complete (%.1fs). Holding at home pose.", elapsed)
+            logger.info("Homing complete (%.1fs).", elapsed)
+            # Fall through to produce final targets (home position for homed side,
+            # observed hold for other side) then return below.
 
         self._last_raw_target_deg = dict(targets)
         filtered = self._filter_target(targets)
