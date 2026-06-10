@@ -491,9 +491,14 @@ class XRIKController:
         any_active = False
         for name, config in self.manipulator_config.items():
             if name in _homing_hands:
-                # Homing in progress: hold effector, skip XR update
+                # Homing: hold effector at CURRENT pose (never snapped — avoids
+                # contaminating the solver with another arm's frozen state).
                 self.active[name] = False
-                self._hold_effector_at_current_pose(name)
+                T = self.placo_robot.get_T_world_frame(self.task_link_name[name])
+                if self.effector_control_mode.get(name) in ("position", "position_wrist"):
+                    self.effector_task[name].target_world = T[:3, 3].copy()
+                else:
+                    self.effector_task[name].T_world_frame = T.copy()
                 continue
             xr_grip_val = self.xr_client.get_key_value_by_name(config["control_trigger"])
             self.active[name] = xr_grip_val > 0.9
