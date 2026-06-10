@@ -584,8 +584,21 @@ class XRIKController:
             self._last_output_target_deg = dict(clipped)
             return clipped
 
-        # 4. Solve (always, like base controller does)
+        # 4. Solve — pin homed arm joints to homing targets first so IK
+        #    only moves the non-homed arm.
         q_before_solve = self.placo_robot.state.q.copy()
+        if self._homing_sides:
+            for side in self._homing_sides:
+                prefix = f"{side}_" if self.mode == "dual" else ""
+                for joint in SO101_JOINT_NAMES:
+                    if joint == "gripper":
+                        continue
+                    q_idx = self._q_index(f"{prefix}{joint}")
+                    motor_name = f"{side}_{joint}"
+                    if q_idx is not None and motor_name in homing_overrides:
+                        self.placo_robot.state.q[q_idx] = float(np.radians(homing_overrides[motor_name]))
+            self.placo_robot.update_kinematics()
+
         try:
             if self._uses_position_wrist_4dof_solver():
                 self._solve_position_wrist_4dof()
@@ -606,6 +619,17 @@ class XRIKController:
             return homing_overrides
 
         self._restore_inactive_arm_joints(q_before_solve)
+        # Re-pin homed arm joints after solve (solver may have nudged them)
+        if self._homing_sides:
+            for side in self._homing_sides:
+                prefix = f"{side}_" if self.mode == "dual" else ""
+                for joint in SO101_JOINT_NAMES:
+                    if joint == "gripper":
+                        continue
+                    q_idx = self._q_index(f"{prefix}{joint}")
+                    motor_name = f"{side}_{joint}"
+                    if q_idx is not None and motor_name in homing_overrides:
+                        self.placo_robot.state.q[q_idx] = float(np.radians(homing_overrides[motor_name]))
         self._ik_failure_count = 0
         targets = self._ik_to_motor_dict()
         targets.update(homing_overrides)
