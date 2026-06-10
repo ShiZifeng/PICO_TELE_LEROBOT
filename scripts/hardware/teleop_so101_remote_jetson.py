@@ -239,9 +239,10 @@ def main():
     def _control_loop():
         period = 1.0 / args.control_fps
         next_tick = time.perf_counter()
-        seq, tx_seq = 0, 0
+        seq, tx_seq = 0, 0                      # seq is the absolute control tick counter (never reset)
         prev_keys = None; tx_updates = 0; tx_msgs = 0
         last_stats_t = time.perf_counter()
+        last_stats_seq = 0
         while not _control_stop.is_set():
             t0 = time.perf_counter()
             # Drain ZMQ targets
@@ -291,9 +292,10 @@ def main():
             now = time.perf_counter()
             if now - last_stats_t >= 2.0:
                 dt = now - last_stats_t
+                ticks_delta = seq - last_stats_seq
                 logger.info("Control stats: motor=%.1f/s targets=%d/s updates=%d/s",
-                            seq/dt, tx_msgs/dt, tx_updates/dt)
-                seq = 0; tx_msgs = 0; tx_updates = 0; last_stats_t = now
+                            ticks_delta / dt, tx_msgs / dt, tx_updates / dt)
+                last_stats_seq = seq; tx_msgs = 0; tx_updates = 0; last_stats_t = now
 
             next_tick += period
             sleep_s = next_tick - time.perf_counter()
@@ -332,7 +334,6 @@ def main():
     logger.info("Control: %.1f Hz, Record: %.1f Hz (every %d ticks)",
                 args.control_fps, args.fps, _ticks_per_record)
 
-    latest_target: Optional[dict] = None
     last_setup_resend = time.perf_counter()
 
     try:
@@ -359,12 +360,6 @@ def main():
             except zmq.Again:
                 pass
 
-            # Update latest_target for setup resend logic
-            if action is not None:
-                latest_target = {k.replace(".pos", ""): v for k, v in action.items()}
-            else:
-                latest_target = None
-
             # ── Build frame ──
             obs_values = [obs.get(name, 0.0) for name in joint_names]
             frame = {"observation.state": np.array(obs_values, dtype=np.float32)}
@@ -384,9 +379,10 @@ def main():
             except zmq.Again:
                 pass
 
-            # Re-send setup every 2s until PC acknowledges (receives targets)
+            # Re-send setup every 2s unconditionally until a frame has been
+            # sent successfully (guards against ZMQ NOBLOCK drop at startup).
             now = time.perf_counter()
-            if latest_target is None and now - last_setup_resend > 2.0:
+            if now - last_setup_resend > 2.0:
                 try:
                     obs_socket.send_pyobj(setup_msg, flags=zmq.NOBLOCK)
                 except zmq.Again:
