@@ -231,6 +231,10 @@ def main():
     _control_state = {"action": None, "observation": None, "obs_t": 0.0, "seq": 0}
     _control_lock = _th2.Lock()
     _control_stop = _th2.Event()
+    # Condition: control thread signals main loop every control_fps/fps ticks
+    _record_condition = _th2.Condition(_control_lock)
+    _record_ready = False
+    _ticks_per_record = max(1, int(round(args.control_fps / args.fps)))  # e.g. 60/15 = 4
 
     def _control_loop():
         period = 1.0 / args.control_fps
@@ -268,6 +272,10 @@ def main():
                 obs_t = time.perf_counter()
                 with _control_lock:
                     _control_state["observation"] = obs; _control_state["obs_t"] = obs_t; _control_state["seq"] = seq
+                    # Signal main loop every Nth tick (non-blocking for control thread)
+                    if seq % _ticks_per_record == 0:
+                        _record_ready = True
+                        _record_condition.notify()
                 if state_socket is not None:
                     sf = {f"observation.{n}": v for n, v in obs.items()}
                     if action is not None:
@@ -321,16 +329,28 @@ def main():
         pass
 
     logger.info("Ready. Waiting for joint targets from PC...")
+    logger.info("Control: %.1f Hz, Record: %.1f Hz (every %d ticks)",
+                args.control_fps, args.fps, _ticks_per_record)
 
     latest_target: Optional[dict] = None
     last_setup_resend = time.perf_counter()
-    period = 1.0 / args.fps
 
     try:
         while True:
-            loop_start = time.perf_counter()
+            # ── Wait for control thread to signal a record tick ──
+            with _record_condition:
+                while not _record_ready and not _control_stop.is_set():
+                    _record_condition.wait(timeout=0.5)
+                if _control_stop.is_set():
+                    break
+                obs = dict(_control_state["observation"])
+                action = _control_state.get("action")
+                _record_ready = False
+                # If no observation yet, keep waiting
+                if obs is None:
+                    continue
 
-            # Check for stop command
+            # Check for stop command (non-blocking, outside lock)
             try:
                 cmd = cmd_socket.recv_string(flags=zmq.NOBLOCK)
                 if cmd == "stop":
@@ -339,24 +359,15 @@ def main():
             except zmq.Again:
                 pass
 
-            # Get latest observation from control thread
-            with _control_lock:
-                obs = dict(_control_state["observation"]) if _control_state["observation"] is not None else None
-                action = _control_state.get("action")
-            if obs is None:
-                busy_wait(max(0, period - (time.perf_counter() - loop_start)))
-                continue
             # Update latest_target for setup resend logic
             if action is not None:
                 latest_target = {k.replace(".pos", ""): v for k, v in action.items()}
             else:
                 latest_target = None
 
-            frame = {}
-            # Build aggregated observation.state (aligned with lerobot format)
+            # ── Build frame ──
             obs_values = [obs.get(name, 0.0) for name in joint_names]
-            frame["observation.state"] = np.array(obs_values, dtype=np.float32)
-            # Build aggregated action (latest PC IK target), fall back to observation
+            frame = {"observation.state": np.array(obs_values, dtype=np.float32)}
             action_values = [
                 action[name] if (action is not None and name in action) else obs.get(name, 0.0)
                 for name in joint_names
@@ -381,8 +392,6 @@ def main():
                 except zmq.Again:
                     pass
                 last_setup_resend = now
-
-            busy_wait(max(0, period - (time.perf_counter() - loop_start)))
 
     except KeyboardInterrupt:
         logger.info("Interrupted.")
