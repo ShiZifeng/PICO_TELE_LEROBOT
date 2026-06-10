@@ -289,14 +289,24 @@ class XRIKController:
         self._homing_start_positions_deg: Dict[str, float] = {}
         self._homing_button_was_down = False
         self._homing_button_name = "Y"  # also checks B as alternative
-        # Neutral home pose (motor degrees). Same for both arms.
+        # Neutral home pose (motor degrees). Per-side values from observed resting pose.
         self._home_pose_deg = {
-            "shoulder_pan": 0.0,
-            "shoulder_lift": -15.0,
-            "elbow_flex": 90.0,
-            "wrist_flex": 45.0,
-            "wrist_roll": 0.0,
-            "gripper": 50.0,
+            "left": {
+                "shoulder_pan": 0.0,
+                "shoulder_lift": -80.0,
+                "elbow_flex": 84.0,
+                "wrist_flex": 85.0,
+                "wrist_roll": -57.0,
+                "gripper": 45.0,
+            },
+            "right": {
+                "shoulder_pan": 4.0,
+                "shoulder_lift": -83.0,
+                "elbow_flex": 86.0,
+                "wrist_flex": 89.0,
+                "wrist_roll": -53.0,
+                "gripper": 45.0,
+            },
         }
 
         logger.info(
@@ -387,8 +397,8 @@ class XRIKController:
             self._homing_active = False
             targets = {}
             for side in self.sides:
-                prefix = f"{side}_" if self.mode == "dual" else ""
-                for joint, home_deg in self._home_pose_deg.items():
+                side_pose = self._home_pose_deg.get(side, self._home_pose_deg.get("right", {}))
+                for joint, home_deg in side_pose.items():
                     targets[f"{side}_{joint}"] = home_deg
             logger.info("Homing complete (%.1fs). Holding at home pose.", elapsed)
             self._last_raw_target_deg = dict(targets)
@@ -402,7 +412,8 @@ class XRIKController:
 
         targets = {}
         for side in self.sides:
-            for joint, home_deg in self._home_pose_deg.items():
+            side_pose = self._home_pose_deg.get(side, self._home_pose_deg.get("right", {}))
+            for joint, home_deg in side_pose.items():
                 motor_name = f"{side}_{joint}"
                 start_deg = self._homing_start_positions_deg.get(motor_name, home_deg)
                 targets[motor_name] = float(start_deg + (home_deg - start_deg) * alpha)
